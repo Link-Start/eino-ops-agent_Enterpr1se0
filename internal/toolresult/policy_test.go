@@ -3,11 +3,13 @@ package toolresult
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/Enterpr1se0/opsnerva/internal/agenttool"
 	"github.com/Enterpr1se0/opsnerva/internal/domain"
+	"github.com/Enterpr1se0/opsnerva/internal/sshtunnel"
 )
 
 func TestPolicyPreservesValidationDetails(t *testing.T) {
@@ -38,5 +40,20 @@ func TestPolicyExplainsExactFileEditWhitespace(t *testing.T) {
 	}
 	if result.Code != "conflict" || !result.Retryable || !strings.Contains(result.NextAction, "preserving all leading whitespace") {
 		t.Fatalf("normalized file edit conflict = %#v", result)
+	}
+}
+
+func TestPolicyPreservesTunnelNotFound(t *testing.T) {
+	err := fmt.Errorf("stop tunnel: %w", sshtunnel.ErrNotFound)
+	value, normalizeErr := (Policy{}).Value(context.Background(), "ssh_tunnel", nil, err)
+	if normalizeErr != nil {
+		t.Fatal(normalizeErr)
+	}
+	failure, ok := value.(domain.ToolFailure)
+	if !ok || failure.Code != "not_found" || failure.Retryable {
+		t.Fatalf("missing tunnel classified as an internal or retryable error: %#v", value)
+	}
+	if code, retryable, _ := ClassifyExecError(err); code != "not_found" || retryable {
+		t.Fatalf("missing tunnel execution classification = %q, %v", code, retryable)
 	}
 }

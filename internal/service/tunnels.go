@@ -5,21 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"regexp"
-	"sort"
-	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
 
 	"github.com/Enterpr1se0/opsnerva/internal/domain"
-	"github.com/Enterpr1se0/opsnerva/internal/ids"
 	"github.com/Enterpr1se0/opsnerva/internal/observability"
 	"github.com/Enterpr1se0/opsnerva/internal/sshx"
-	"github.com/Enterpr1se0/opsnerva/internal/store"
 )
 
 const (
@@ -32,116 +24,10 @@ var (
 	ErrHostHasActiveTunnel = errors.New("host has an active SSH tunnel")
 )
 
-type sshTunnelState struct {
-	tunnel          domain.SSHTunnel
-	ctx             context.Context
-	cancel          context.CancelFunc
-	retry           chan struct{}
-	runtimeMu       sync.Mutex
-	runtime         *sshTunnelRuntime
-	stopped         bool
-	connections     sync.WaitGroup
-	connectionMu    sync.Mutex
-	openConnections map[net.Conn]struct{}
-	active          atomic.Int64
-	total           atomic.Int64
-	sent            atomic.Int64
-	received        atomic.Int64
-}
-
-type sshTunnelRuntime struct {
-	ctx       context.Context
-	cancel    context.CancelFunc
-	listener  net.Listener
-	client    sshx.TunnelClient
-	closeOnce sync.Once
-}
-
 type preparedOperatorSSHTunnel struct {
 	host       domain.Host
 	connection sshx.ConnectionSpec
 	request    domain.ExecRequest
-}
-
-func (runtime *sshTunnelRuntime) close() {
-	runtime.closeOnce.Do(func() {
-		runtime.cancel()
-		_ = runtime.listener.Close()
-		_ = runtime.client.Close()
-	})
-}
-
-func (state *sshTunnelState) installRuntime(runtime *sshTunnelRuntime) bool {
-	state.runtimeMu.Lock()
-	defer state.runtimeMu.Unlock()
-	if state.stopped || state.runtime != nil {
-		return false
-	}
-	state.runtime = runtime
-	return true
-}
-
-func (state *sshTunnelState) currentRuntime() *sshTunnelRuntime {
-	state.runtimeMu.Lock()
-	defer state.runtimeMu.Unlock()
-	return state.runtime
-}
-
-func (state *sshTunnelState) closeRuntime(runtime *sshTunnelRuntime) {
-	state.runtimeMu.Lock()
-	if state.runtime == runtime {
-		state.runtime = nil
-	}
-	state.runtimeMu.Unlock()
-	runtime.close()
-	state.closeConnections()
-}
-
-func (state *sshTunnelState) stop() {
-	state.runtimeMu.Lock()
-	state.stopped = true
-	runtime := state.runtime
-	state.runtime = nil
-	state.runtimeMu.Unlock()
-	state.cancel()
-	if runtime != nil {
-		runtime.close()
-	}
-	state.closeConnections()
-}
-
-func (state *sshTunnelState) closeConnections() {
-	state.connectionMu.Lock()
-	connections := make([]net.Conn, 0, len(state.openConnections))
-	for connection := range state.openConnections {
-		connections = append(connections, connection)
-	}
-	state.connectionMu.Unlock()
-	for _, connection := range connections {
-		_ = connection.Close()
-	}
-}
-
-func (state *sshTunnelState) trackConnection(runtime *sshTunnelRuntime, connection net.Conn) bool {
-	state.runtimeMu.Lock()
-	active := !state.stopped && state.runtime == runtime
-	if active {
-		state.connectionMu.Lock()
-		state.openConnections[connection] = struct{}{}
-		state.connectionMu.Unlock()
-	}
-	state.runtimeMu.Unlock()
-	if !active {
-		_ = connection.Close()
-		return false
-	}
-	return true
-}
-
-func (state *sshTunnelState) untrackConnection(connection net.Conn) {
-	state.connectionMu.Lock()
-	delete(state.openConnections, connection)
-	state.connectionMu.Unlock()
 }
 
 func (s *Service) StartSSHTunnel(ctx context.Context, hostID string, config domain.SSHTunnelConfig, reason, actor string) (domain.ExecResult, error) {
@@ -157,18 +43,19 @@ func (s *Service) StartSSHTunnel(ctx context.Context, hostID string, config doma
 	}, actor)
 }
 
-// StartOperatorSSHTunnel starts a tunnel after an authenticated Web operator
-// explicitly submits the form, without entering Agent approval or history.
+// StartOperatorSSHTunnel starts a tunnel explicitly requested by the Web
+// operator, without entering Agent approval or history.
 func (s *Service) StartOperatorSSHTunnel(ctx context.Context, hostID string, config domain.SSHTunnelConfig, _ string) (domain.SSHTunnel, error) {
-	return s.startOperatorSSHTunnel(ctx, hostID, config, "")
-}
-
-func (s *Service) startOperatorSSHTunnel(ctx context.Context, hostID string, config domain.SSHTunnelConfig, stateID string) (domain.SSHTunnel, error) {
 	prepared, err := s.prepareOperatorSSHTunnel(ctx, hostID, config)
 	if err != nil {
 		return domain.SSHTunnel{}, err
 	}
-	return s.startPreparedOperatorSSHTunnel(ctx, prepared, stateID)
+	release, err := s.acquire(ctx, prepared.host.ID)
+	if err != nil {
+		return domain.SSHTunnel{}, err
+	}
+	defer release()
+	return s.createSSHTunnel(ctx, prepared.host, prepared.connection, prepared.request)
 }
 
 func (s *Service) prepareOperatorSSHTunnel(ctx context.Context, hostID string, config domain.SSHTunnelConfig) (preparedOperatorSSHTunnel, error) {
@@ -205,15 +92,6 @@ func (s *Service) prepareOperatorSSHTunnel(ctx context.Context, hostID string, c
 	return preparedOperatorSSHTunnel{host: host, connection: connection, request: req}, nil
 }
 
-func (s *Service) startPreparedOperatorSSHTunnel(ctx context.Context, prepared preparedOperatorSSHTunnel, stateID string) (domain.SSHTunnel, error) {
-	release, err := s.acquire(ctx, prepared.host.ID)
-	if err != nil {
-		return domain.SSHTunnel{}, err
-	}
-	defer release()
-	return s.createSSHTunnel(ctx, prepared.host, prepared.connection, prepared.request, stateID)
-}
-
 // UpdateOperatorSSHTunnel replaces an operator tunnel. Invalid target host or
 // forwarding input is rejected before the existing listener is touched;
 // runtime replacement failures trigger a best-effort rollback.
@@ -231,14 +109,10 @@ func (s *Service) UpdateOperatorSSHTunnel(ctx context.Context, id, hostID string
 		return domain.SSHTunnel{}, err
 	}
 
-	s.tunnelMu.RLock()
-	state, ok := s.tunnels[id]
-	if !ok {
-		s.tunnelMu.RUnlock()
-		return domain.SSHTunnel{}, store.ErrNotFound
+	previous, err := s.tunnels.Get(id)
+	if err != nil {
+		return domain.SSHTunnel{}, err
 	}
-	previous := tunnelSnapshot(state)
-	s.tunnelMu.RUnlock()
 	if previous.Status != "running" {
 		return domain.SSHTunnel{}, fmt.Errorf("invalid tunnel status %q: only running tunnels can be edited", previous.Status)
 	}
@@ -251,26 +125,13 @@ func (s *Service) UpdateOperatorSSHTunnel(ctx context.Context, id, hostID string
 		return domain.SSHTunnel{}, err
 	}
 
-	if _, err := s.StopOperatorSSHTunnel(ctx, id, ""); err != nil {
+	// Keep both the replacement and any rollback within host concurrency limits.
+	release, err := s.acquire(ctx, prepared.host.ID, previous.HostID)
+	if err != nil {
 		return domain.SSHTunnel{}, err
 	}
-	replacement, err := s.startPreparedOperatorSSHTunnel(ctx, prepared, "")
-	if err == nil {
-		return replacement, nil
-	}
-
-	updateErr := err
-	rollbackCtx, cancelRollback := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-	defer cancelRollback()
-	_, rollbackErr := s.startOperatorSSHTunnel(rollbackCtx, previous.HostID, domain.SSHTunnelConfig{
-		Direction: previous.Direction, LocalHost: previous.LocalHost, LocalPort: previous.LocalPort,
-		RemoteHost: previous.RemoteHost, RemotePort: previous.RemotePort,
-	}, previous.ID)
-	if rollbackErr == nil {
-		return domain.SSHTunnel{}, fmt.Errorf("update SSH tunnel: %w; previous tunnel restored", updateErr)
-	}
-
-	return domain.SSHTunnel{}, fmt.Errorf("update SSH tunnel: %w; restore previous tunnel: %v", updateErr, rollbackErr)
+	defer release()
+	return s.tunnels.Replace(ctx, previous.ID, prepared.host, prepared.connection, config)
 }
 
 func (s *Service) normalizedSSHTunnelConfig(config domain.SSHTunnelConfig) (domain.SSHTunnelConfig, error) {
@@ -289,17 +150,10 @@ func (s *Service) normalizedSSHTunnelConfig(config domain.SSHTunnelConfig) (doma
 	}, nil
 }
 
-func (s *Service) ListSSHTunnels() domain.SSHTunnelList {
-	s.tunnelMu.RLock()
-	tunnels := make([]domain.SSHTunnel, 0, len(s.tunnels))
-	for _, state := range s.tunnels {
-		tunnels = append(tunnels, tunnelSnapshot(state))
-	}
-	s.tunnelMu.RUnlock()
-	sort.Slice(tunnels, func(left, right int) bool {
-		return tunnels[left].StartedAt.Before(tunnels[right].StartedAt)
-	})
-	return domain.SSHTunnelList{Tunnels: tunnels, Count: len(tunnels)}
+func (s *Service) ListSSHTunnels() domain.SSHTunnelList { return s.tunnels.List() }
+
+func (s *Service) RetryOperatorSSHTunnel(ctx context.Context, id string) error {
+	return s.tunnels.Retry(ctx, id)
 }
 
 func (s *Service) StopSSHTunnel(ctx context.Context, id, actor string) (domain.SSHTunnel, error) {
@@ -322,38 +176,18 @@ func (s *Service) StopOperatorSSHTunnel(ctx context.Context, id, _ string) (doma
 }
 
 func (s *Service) stopSSHTunnel(ctx context.Context, id string) (domain.SSHTunnel, error) {
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return domain.SSHTunnel{}, fmt.Errorf("tunnel_id is required")
+	stopped, err := s.tunnels.Stop(ctx, id)
+	if err != nil {
+		return domain.SSHTunnel{}, err
 	}
-	s.tunnelMu.Lock()
-	state, ok := s.tunnels[id]
-	if !ok {
-		s.tunnelMu.Unlock()
-		return domain.SSHTunnel{}, store.ErrNotFound
-	}
-	state.tunnel.Status = "stopping"
-	stopping := tunnelSnapshot(state)
-	s.tunnelMu.Unlock()
-	s.publishTunnelState(stopping, false)
-
-	state.stop()
-
-	s.tunnelMu.Lock()
-	state.tunnel.Status = "stopped"
-	stopped := tunnelSnapshot(state)
-	delete(s.tunnels, id)
-	s.tunnelMu.Unlock()
-	s.publishTunnelState(stopped, true)
-	observability.FromContext(ctx).InfoContext(ctx, "SSH tunnel stopped",
-		"component", "ssh_tunnel", "tunnel_id", id, "host_id", stopped.HostID,
-		"direction", stopped.Direction, "local_host", stopped.LocalHost, "local_port", stopped.LocalPort,
-		"remote_host", stopped.RemoteHost, "remote_port", stopped.RemotePort)
+	observability.FromContext(ctx).InfoContext(ctx, "SSH tunnel stopped", "component", "ssh_tunnel",
+		"tunnel_id", stopped.ID, "host_id", stopped.HostID, "direction", stopped.Direction,
+		"local_host", stopped.LocalHost, "local_port", stopped.LocalPort, "remote_host", stopped.RemoteHost, "remote_port", stopped.RemotePort)
 	return stopped, nil
 }
 
 func (s *Service) openSSHTunnel(ctx context.Context, host domain.Host, connection sshx.ConnectionSpec, req domain.ExecRequest, actor string) (domain.SSHTunnel, error) {
-	startedTunnel, err := s.createSSHTunnel(ctx, host, connection, req, "")
+	startedTunnel, err := s.createSSHTunnel(ctx, host, connection, req)
 	if err != nil {
 		return domain.SSHTunnel{}, err
 	}
@@ -365,319 +199,28 @@ func (s *Service) openSSHTunnel(ctx context.Context, host domain.Host, connectio
 	return startedTunnel, nil
 }
 
-func (s *Service) createSSHTunnel(ctx context.Context, host domain.Host, connection sshx.ConnectionSpec, req domain.ExecRequest, tunnelID string) (domain.SSHTunnel, error) {
-	transport, ok := s.transport.(sshx.TunnelTransport)
-	if !ok {
-		return domain.SSHTunnel{}, fmt.Errorf("configured SSH transport does not support port forwarding")
-	}
+func (s *Service) createSSHTunnel(ctx context.Context, host domain.Host, connection sshx.ConnectionSpec, req domain.ExecRequest) (domain.SSHTunnel, error) {
 	if err := validateSSHTunnelRequest(req); err != nil {
 		return domain.SSHTunnel{}, err
 	}
+	return s.tunnels.Start(ctx, host, connection, domain.SSHTunnelConfig{
+		Direction: req.TunnelDirection, LocalHost: req.TunnelLocalHost, LocalPort: req.TunnelLocalPort,
+		RemoteHost: req.TunnelRemoteHost, RemotePort: req.TunnelRemotePort})
+}
 
-	s.executionMu.Lock()
-	if s.executionClosed {
-		s.executionMu.Unlock()
-		return domain.SSHTunnel{}, fmt.Errorf("service is shutting down")
-	}
-	s.executionWG.Add(1)
-	s.executionMu.Unlock()
-	workerStarted := false
-	defer func() {
-		if !workerStarted {
-			s.executionWG.Done()
-		}
-	}()
-
-	tunnelCtx, cancelTunnel := context.WithCancel(s.executionCtx)
-	runtime, localPort, remotePort, err := openSSHTunnelRuntime(ctx, tunnelCtx, transport, connection, req)
+// Resolve current credentials for reconnection and edit rollback. Initial
+// starts use the connection already validated by the approval/operator path.
+func (s *Service) resolveTunnelConnection(ctx context.Context, hostID string) (domain.Host, sshx.ConnectionSpec, error) {
+	host, err := s.store.GetHost(ctx, hostID)
 	if err != nil {
-		cancelTunnel()
-		return domain.SSHTunnel{}, err
+		return domain.Host{}, sshx.ConnectionSpec{}, err
 	}
-
-	proxyUsed := connection.Target.ProxyURL != "" || len(connection.Jumps) > 0
-	tunnelID = strings.TrimSpace(tunnelID)
-	if tunnelID == "" {
-		tunnelID = ids.New("tunnel")
-	}
-	state := &sshTunnelState{
-		tunnel: domain.SSHTunnel{
-			ID: tunnelID, HostID: host.ID, HostName: host.Name,
-			Direction: req.TunnelDirection, LocalHost: req.TunnelLocalHost, LocalPort: localPort,
-			RemoteHost: req.TunnelRemoteHost, RemotePort: remotePort,
-			Status: "running", ProxyUsed: proxyUsed, StartedAt: time.Now().UTC(),
-		},
-		ctx: tunnelCtx, cancel: cancelTunnel, retry: make(chan struct{}, 1), openConnections: make(map[net.Conn]struct{}),
-	}
-	if !state.installRuntime(runtime) {
-		runtime.close()
-		cancelTunnel()
-		return domain.SSHTunnel{}, fmt.Errorf("initialize SSH tunnel runtime")
-	}
-	s.tunnelMu.Lock()
-	s.tunnels[state.tunnel.ID] = state
-	startedTunnel := tunnelSnapshot(state)
-	s.tunnelMu.Unlock()
-	s.publishTunnelState(startedTunnel, false)
-	workerStarted = true
-	go s.runSSHTunnel(state)
-
-	observability.FromContext(ctx).InfoContext(ctx, "SSH tunnel started",
-		"component", "ssh_tunnel", "tunnel_id", startedTunnel.ID, "host_id", host.ID,
-		"direction", startedTunnel.Direction, "local_host", startedTunnel.LocalHost,
-		"local_port", startedTunnel.LocalPort, "remote_host", startedTunnel.RemoteHost,
-		"remote_port", startedTunnel.RemotePort, "proxy_used", proxyUsed)
-	return startedTunnel, nil
-}
-
-func openSSHTunnelRuntime(startupParent, tunnelCtx context.Context, transport sshx.TunnelTransport, connection sshx.ConnectionSpec, req domain.ExecRequest) (*sshTunnelRuntime, int, int, error) {
-	runtimeCtx, cancelRuntime := context.WithCancel(tunnelCtx)
-	startupCtx, cancelStartup := context.WithCancel(startupParent)
-	stopStartup := context.AfterFunc(runtimeCtx, cancelStartup)
-	client, err := transport.OpenTunnel(startupCtx, connection)
-	stopStartup()
-	cancelStartup()
+	connection, _, err := s.resolveSSHConnection(ctx, host)
 	if err != nil {
-		cancelRuntime()
-		return nil, 0, 0, err
+		return domain.Host{}, sshx.ConnectionSpec{}, err
 	}
-	if err := runtimeCtx.Err(); err != nil {
-		cancelRuntime()
-		_ = client.Close()
-		return nil, 0, 0, err
-	}
-
-	var listener net.Listener
-	switch req.TunnelDirection {
-	case domain.SSHTunnelDirectionLocal:
-		listener, err = net.Listen("tcp", net.JoinHostPort(req.TunnelLocalHost, strconv.Itoa(req.TunnelLocalPort)))
-		if err != nil {
-			cancelRuntime()
-			_ = client.Close()
-			return nil, 0, 0, fmt.Errorf("listen on local endpoint %s:%d: %w", req.TunnelLocalHost, req.TunnelLocalPort, err)
-		}
-	case domain.SSHTunnelDirectionReverse:
-		reverseClient, ok := client.(sshx.ReverseTunnelClient)
-		if !ok {
-			cancelRuntime()
-			_ = client.Close()
-			return nil, 0, 0, fmt.Errorf("configured SSH transport does not support reverse port forwarding")
-		}
-		listener, err = reverseClient.Listen("tcp", net.JoinHostPort(req.TunnelRemoteHost, strconv.Itoa(req.TunnelRemotePort)))
-		if err != nil {
-			cancelRuntime()
-			_ = client.Close()
-			return nil, 0, 0, fmt.Errorf("listen on remote endpoint %s:%d: %w", req.TunnelRemoteHost, req.TunnelRemotePort, err)
-		}
-	default:
-		cancelRuntime()
-		_ = client.Close()
-		return nil, 0, 0, fmt.Errorf("invalid SSH tunnel direction %q", req.TunnelDirection)
-	}
-	runtime := &sshTunnelRuntime{ctx: runtimeCtx, cancel: cancelRuntime, listener: listener, client: client}
-	_, listenerPortText, err := net.SplitHostPort(listener.Addr().String())
-	if err != nil {
-		runtime.close()
-		return nil, 0, 0, fmt.Errorf("resolve SSH tunnel listener address: %w", err)
-	}
-	listenerPort, err := strconv.Atoi(listenerPortText)
-	if err != nil {
-		runtime.close()
-		return nil, 0, 0, fmt.Errorf("resolve SSH tunnel listener port: %w", err)
-	}
-	localPort, remotePort := req.TunnelLocalPort, req.TunnelRemotePort
-	if req.TunnelDirection == domain.SSHTunnelDirectionLocal {
-		localPort = listenerPort
-	} else {
-		remotePort = listenerPort
-	}
-	return runtime, localPort, remotePort, nil
-}
-
-func (s *Service) runSSHTunnel(state *sshTunnelState) {
-	defer s.executionWG.Done()
-	defer func() {
-		state.stop()
-		s.tunnelMu.Lock()
-		removed := false
-		if current := s.tunnels[state.tunnel.ID]; current == state {
-			if state.tunnel.Status != "stopping" && state.tunnel.Status != "stopped" {
-				state.tunnel.Status = "failed"
-				if state.tunnel.Error == "" {
-					state.tunnel.Error = "SSH tunnel stopped unexpectedly"
-				}
-			}
-			removed = true
-			delete(s.tunnels, state.tunnel.ID)
-		}
-		terminal := tunnelSnapshot(state)
-		s.tunnelMu.Unlock()
-		if removed {
-			s.publishTunnelState(terminal, true)
-		}
-	}()
-	runtime := state.currentRuntime()
-	for runtime != nil {
-		terminalErr := s.serveSSHTunnelRuntime(state, runtime)
-		unexpected := state.ctx.Err() == nil
-		state.closeRuntime(runtime)
-		state.connections.Wait()
-		if !unexpected {
-			return
-		}
-
-		failure := "SSH tunnel connection closed"
-		if terminalErr != nil {
-			failure = s.redactor.Redact(terminalErr.Error())
-		}
-		s.tunnelMu.Lock()
-		current, exists := s.tunnels[state.tunnel.ID]
-		if !exists || current != state || state.tunnel.Status == "stopping" || state.tunnel.Status == "stopped" {
-			s.tunnelMu.Unlock()
-			return
-		}
-		state.tunnel.Status = "retrying"
-		state.tunnel.Error = failure
-		state.tunnel.ReconnectAttempt = 0
-		retrying := tunnelSnapshot(state)
-		s.tunnelMu.Unlock()
-		s.publishTunnelState(retrying, false)
-
-		observability.FromContext(context.Background()).WarnContext(context.Background(), "SSH tunnel disconnected; reconnecting",
-			"component", "ssh_tunnel", "tunnel_id", state.tunnel.ID, "host_id", state.tunnel.HostID, "error", failure)
-		runtime = s.reconnectSSHTunnel(state)
-	}
-}
-
-func (s *Service) serveSSHTunnelRuntime(state *sshTunnelState, runtime *sshTunnelRuntime) error {
-	acceptErrors := make(chan error, 1)
-	clientErrors := make(chan error, 1)
-	state.connections.Add(1)
-	go func() {
-		defer state.connections.Done()
-		acceptErrors <- s.acceptSSHTunnelConnections(runtime.ctx, state, runtime)
-	}()
-	go func() { clientErrors <- runtime.client.Wait() }()
-
-	select {
-	case <-runtime.ctx.Done():
-		return nil
-	case err := <-acceptErrors:
-		return err
-	case err := <-clientErrors:
-		return err
-	}
-}
-
-func (s *Service) acceptSSHTunnelConnections(ctx context.Context, state *sshTunnelState, runtime *sshTunnelRuntime) error {
-	targetAddress := net.JoinHostPort(state.tunnel.RemoteHost, strconv.Itoa(state.tunnel.RemotePort))
-	acceptSide := "local"
-	if state.tunnel.Direction == domain.SSHTunnelDirectionReverse {
-		targetAddress = net.JoinHostPort(state.tunnel.LocalHost, strconv.Itoa(state.tunnel.LocalPort))
-		acceptSide = "remote"
-	}
-	for {
-		inbound, err := runtime.listener.Accept()
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			return fmt.Errorf("accept %s tunnel connection: %w", acceptSide, err)
-		}
-		if !state.trackConnection(runtime, inbound) {
-			return nil
-		}
-		state.total.Add(1)
-		state.active.Add(1)
-		state.connections.Add(1)
-		go s.forwardSSHTunnelConnection(ctx, state, runtime, inbound, targetAddress)
-	}
-}
-
-func (s *Service) forwardSSHTunnelConnection(ctx context.Context, state *sshTunnelState, runtime *sshTunnelRuntime, inbound net.Conn, targetAddress string) {
-	defer state.connections.Done()
-	defer state.active.Add(-1)
-	defer state.untrackConnection(inbound)
-	var target net.Conn
-	var err error
-	endpointSide := "remote"
-	if state.tunnel.Direction == domain.SSHTunnelDirectionReverse {
-		endpointSide = "local"
-		target, err = (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, "tcp", targetAddress)
-	} else {
-		target, err = runtime.client.Dial("tcp", targetAddress)
-	}
-	if err != nil {
-		_ = inbound.Close()
-		s.tunnelMu.Lock()
-		if current := s.tunnels[state.tunnel.ID]; current == state && state.tunnel.Status == "running" {
-			state.tunnel.Error = s.redactor.Redact(fmt.Sprintf("connect %s endpoint %s: %v", endpointSide, targetAddress, err))
-		}
-		failedConnection := tunnelSnapshot(state)
-		s.tunnelMu.Unlock()
-		s.publishTunnelState(failedConnection, false)
-		return
-	}
-	if !state.trackConnection(runtime, target) {
-		return
-	}
-	defer state.untrackConnection(target)
-	s.tunnelMu.Lock()
-	if current := s.tunnels[state.tunnel.ID]; current == state && state.tunnel.Status == "running" {
-		state.tunnel.Error = ""
-	}
-	connected := tunnelSnapshot(state)
-	s.tunnelMu.Unlock()
-	s.publishTunnelState(connected, false)
-	defer inbound.Close()
-	defer target.Close()
-
-	inboundTotal, targetTotal := &state.sent, &state.received
-	if state.tunnel.Direction == domain.SSHTunnelDirectionReverse {
-		inboundTotal, targetTotal = &state.received, &state.sent
-	}
-
-	var relay sync.WaitGroup
-	relay.Add(2)
-	go func() {
-		defer relay.Done()
-		_, _ = io.Copy(countingWriter{writer: target, total: inboundTotal}, inbound)
-		closeWrite(target)
-	}()
-	go func() {
-		defer relay.Done()
-		_, _ = io.Copy(countingWriter{writer: inbound, total: targetTotal}, target)
-		closeWrite(inbound)
-	}()
-	relay.Wait()
-}
-
-type countingWriter struct {
-	writer io.Writer
-	total  *atomic.Int64
-}
-
-func (writer countingWriter) Write(data []byte) (int, error) {
-	written, err := writer.writer.Write(data)
-	writer.total.Add(int64(written))
-	return written, err
-}
-
-func closeWrite(connection net.Conn) {
-	if halfCloser, ok := connection.(interface{ CloseWrite() error }); ok {
-		_ = halfCloser.CloseWrite()
-		return
-	}
-	_ = connection.Close()
-}
-
-func tunnelSnapshot(state *sshTunnelState) domain.SSHTunnel {
-	result := state.tunnel
-	result.ActiveConnections = state.active.Load()
-	result.TotalConnections = state.total.Load()
-	result.BytesSent = state.sent.Load()
-	result.BytesReceived = state.received.Load()
-	return result
+	connection, err = s.hydrateSSHConnection(connection, false)
+	return host, connection, err
 }
 
 func validateSSHTunnelRequest(req domain.ExecRequest) error {
@@ -743,17 +286,6 @@ func validateSSHTunnelHost(field, value string, requireIP bool) error {
 func sshTunnelFieldsSet(req domain.ExecRequest) bool {
 	return req.TunnelDirection != "" || req.TunnelLocalHost != "" || req.TunnelLocalPort != 0 ||
 		req.TunnelRemoteHost != "" || req.TunnelRemotePort != 0
-}
-
-func (s *Service) hasSSHTunnelForHost(hostID string) bool {
-	s.tunnelMu.RLock()
-	defer s.tunnelMu.RUnlock()
-	for _, state := range s.tunnels {
-		if state.tunnel.HostID == hostID {
-			return true
-		}
-	}
-	return false
 }
 
 func marshalSSHTunnel(tunnel domain.SSHTunnel) ([]byte, error) {

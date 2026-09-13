@@ -9,6 +9,7 @@ import (
 	"github.com/Enterpr1se0/opsnerva/internal/domain"
 	"github.com/Enterpr1se0/opsnerva/internal/service"
 	"github.com/Enterpr1se0/opsnerva/internal/skills"
+	"github.com/Enterpr1se0/opsnerva/internal/sshtunnel"
 	"github.com/Enterpr1se0/opsnerva/internal/store"
 )
 
@@ -79,7 +80,7 @@ func ClassifyExecError(err error) (string, bool, string) {
 	}
 	message := strings.ToLower(err.Error())
 	switch {
-	case errors.Is(err, store.ErrNotFound):
+	case errors.Is(err, store.ErrNotFound), errors.Is(err, sshtunnel.ErrNotFound):
 		return "not_found", false, "verify the identifier or list available resources; do not retry the same missing identifier"
 	case errors.Is(err, context.DeadlineExceeded), strings.Contains(message, "timed out"), strings.Contains(message, "timeout"):
 		return "timeout", true, "narrow the operation or set background=true on ssh_exec or ssh_run_script for a long-running command"
@@ -146,7 +147,7 @@ func Classify(toolName string, err error) (code, message string, retryable bool,
 		return "wrong_tool", rootMessage, false, selectionErr.NextAction
 	case errors.Is(err, service.ErrAgentHostAccessDenied), errors.Is(err, service.ErrAgentRootAccessDenied), errors.Is(err, service.ErrHostAgentRootUnavailable):
 		return "denied", rootMessage, false, "respect the host Agent and root access settings; do not retry unchanged input"
-	case errors.Is(err, store.ErrNotFound), errors.Is(err, skills.ErrNotFound):
+	case errors.Is(err, store.ErrNotFound), errors.Is(err, skills.ErrNotFound), errors.Is(err, sshtunnel.ErrNotFound):
 		return "not_found", rootMessage, false, "list or read the available resources and use a valid identifier"
 	case errors.Is(err, skills.ErrDisabled):
 		return "configuration_required", rootMessage, false, "tell the operator that the requested skill is disabled; do not retry it"

@@ -3,12 +3,10 @@ package service
 import (
 	"context"
 	"errors"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/Enterpr1se0/opsnerva/internal/domain"
-	"github.com/Enterpr1se0/opsnerva/internal/store"
 )
 
 func TestOperatorTunnelManualRetrySkipsBackoff(t *testing.T) {
@@ -56,34 +54,5 @@ func TestOperatorTunnelManualRetrySkipsBackoff(t *testing.T) {
 				t.Fatalf("opened %d SSH clients, want initial plus one replacement", clients)
 			}
 		})
-	}
-}
-
-func TestOperatorTunnelManualRetriesCoalesceAndRespectStop(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	state := &sshTunnelState{ctx: ctx, retry: make(chan struct{}, 1), tunnel: domain.SSHTunnel{ID: "retry", Status: "retrying"}}
-	svc := &Service{tunnels: map[string]*sshTunnelState{"retry": state}}
-	var callers sync.WaitGroup
-	for range 20 {
-		callers.Go(func() {
-			if err := svc.RetryOperatorSSHTunnel(context.Background(), "retry"); err != nil {
-				t.Error(err)
-			}
-		})
-	}
-	callers.Wait()
-	if len(state.retry) != 1 {
-		t.Fatalf("pending retries = %d, want 1", len(state.retry))
-	}
-	cancel()
-	if err := svc.RetryOperatorSSHTunnel(context.Background(), "retry"); err == nil {
-		t.Fatal("cancelled tunnel accepted a manual retry")
-	}
-	if err := svc.RetryOperatorSSHTunnel(ctx, "retry"); !errors.Is(err, context.Canceled) {
-		t.Fatalf("cancelled request = %v", err)
-	}
-	if err := svc.RetryOperatorSSHTunnel(context.Background(), "missing"); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("unknown tunnel = %v", err)
 	}
 }

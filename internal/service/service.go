@@ -9,6 +9,7 @@ import (
 	"github.com/Enterpr1se0/opsnerva/internal/config"
 	"github.com/Enterpr1se0/opsnerva/internal/security"
 	"github.com/Enterpr1se0/opsnerva/internal/skills"
+	"github.com/Enterpr1se0/opsnerva/internal/sshtunnel"
 	"github.com/Enterpr1se0/opsnerva/internal/sshx"
 	"github.com/Enterpr1se0/opsnerva/internal/store"
 	"github.com/Enterpr1se0/opsnerva/internal/websearch"
@@ -77,8 +78,7 @@ type Service struct {
 	sftpDeletions           map[string]*sftpDeletionState
 	sftpDeletionSequence    uint64
 	unsubscribeStoreChanges func()
-	tunnelMu                sync.RWMutex
-	tunnels                 map[string]*sshTunnelState
+	tunnels                 *sshtunnel.Manager
 	shells                  *shellRegistry
 	hostShellProbes         singleflight.Group
 	webSearch               *websearch.Client
@@ -101,7 +101,6 @@ func New(st *store.Store, transport sshx.Transport, encryptor *security.Encrypto
 		automaticApprovalSem: make(chan struct{}, maxConcurrentApprovalExplanations),
 		executionCtx:         executionCtx, executionCancel: executionCancel,
 		executionCancels: make(map[string]context.CancelFunc), cancelledExecutions: make(map[string]struct{}),
-		tunnels:   make(map[string]*sshTunnelState),
 		shells:    newShellRegistry(),
 		webSearch: websearch.New(redactor),
 	}
@@ -113,6 +112,8 @@ func New(st *store.Store, transport sshx.Transport, encryptor *security.Encrypto
 			result.validators[validator.ID] = validator
 		}
 	}
+	tunnelTransport, _ := transport.(sshx.TunnelTransport)
+	result.tunnels = sshtunnel.New(tunnelTransport, result.resolveTunnelConnection, result.publishTunnelState, redactor)
 	result.unsubscribeStoreChanges = st.SubscribeChanges(result.publishStoreChange)
 	return result
 }
@@ -121,6 +122,7 @@ func (s *Service) Store() *store.Store { return s.store }
 
 func (s *Service) Shutdown(ctx context.Context) error {
 	shellDone := s.shells.shutdown()
+	tunnelDone := s.tunnels.Close()
 	s.executionMu.Lock()
 	if !s.executionClosed {
 		s.executionClosed = true
@@ -136,6 +138,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	go func() {
 		s.executionWG.Wait()
 		<-shellDone
+		<-tunnelDone
 		close(done)
 	}()
 	select {

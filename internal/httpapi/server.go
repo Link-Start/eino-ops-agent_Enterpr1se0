@@ -31,6 +31,7 @@ import (
 	"github.com/Enterpr1se0/opsnerva/internal/security"
 	"github.com/Enterpr1se0/opsnerva/internal/service"
 	"github.com/Enterpr1se0/opsnerva/internal/skills"
+	"github.com/Enterpr1se0/opsnerva/internal/sshtunnel"
 	"github.com/Enterpr1se0/opsnerva/internal/store"
 	"github.com/Enterpr1se0/opsnerva/internal/websearch"
 	webui "github.com/Enterpr1se0/opsnerva/web"
@@ -1943,7 +1944,7 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 
 func writeError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
-	if errors.Is(err, store.ErrNotFound) || errors.Is(err, os.ErrNotExist) {
+	if errors.Is(err, store.ErrNotFound) || errors.Is(err, sshtunnel.ErrNotFound) || errors.Is(err, os.ErrNotExist) {
 		status = http.StatusNotFound
 	} else if errors.Is(err, service.ErrHostHasActiveTunnel) {
 		status = http.StatusConflict

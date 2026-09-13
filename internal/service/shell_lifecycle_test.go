@@ -10,6 +10,7 @@ import (
 
 	"github.com/Enterpr1se0/opsnerva/internal/domain"
 	"github.com/Enterpr1se0/opsnerva/internal/security"
+	"github.com/Enterpr1se0/opsnerva/internal/sshtunnel"
 	"github.com/Enterpr1se0/opsnerva/internal/sshx"
 	"github.com/Enterpr1se0/opsnerva/internal/store"
 )
@@ -126,6 +127,7 @@ func TestShellLifecycleShutdownReportsUndrainedHistory(t *testing.T) {
 	// Use an in-memory failing history, not a closed shared Store, so the
 	// failure is deterministic and does not invalidate other cleanup paths.
 	svc := &Service{shells: newShellRegistry(), redactor: security.NewRedactor(), executionCancel: func() {}}
+	svc.tunnels = sshtunnel.New(nil, nil, nil, svc.redactor)
 	state := registryShell("undrained", "host", "starting")
 	history := &faultShellHistory{shellHistory: state.history, failures: 100}
 	state.history = history

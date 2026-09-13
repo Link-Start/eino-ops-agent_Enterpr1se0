@@ -220,7 +220,7 @@ func (s *Service) withStoredHostKey(host domain.Host) domain.Host {
 }
 
 func (s *Service) DeleteHost(ctx context.Context, id, actor string) error {
-	if s.hasSSHTunnelForHost(id) {
+	if s.tunnels.HasHost(id) {
 		return fmt.Errorf("%w: stop the tunnel before deleting host %q", ErrHostHasActiveTunnel, id)
 	}
 	if s.shells.hasActive(func(shell domain.SSHShell) bool { return shell.HostID == id }) {

@@ -510,22 +510,12 @@ func TestStoppingTunnelCancelsAutomaticReconnect(t *testing.T) {
 	if _, err := svc.StopOperatorSSHTunnel(context.Background(), started.ID, "admin-web"); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(sshTunnelReconnectInitialDelay + 100*time.Millisecond)
+	time.Sleep(1100 * time.Millisecond)
 	transport.mu.Lock()
 	connectAttempts := len(transport.tunnelClients)
 	transport.mu.Unlock()
 	if connectAttempts != 1 || svc.ListSSHTunnels().Count != 0 {
 		t.Fatalf("stopped tunnel reconnected: attempts=%d tunnels=%#v", connectAttempts, svc.ListSSHTunnels())
-	}
-}
-
-func TestSSHTunnelReconnectDelayIsBounded(t *testing.T) {
-	for attempt, expected := range map[int]time.Duration{
-		0: time.Second, 1: time.Second, 2: 2 * time.Second, 5: 16 * time.Second, 6: 30 * time.Second, 100: 30 * time.Second,
-	} {
-		if actual := sshTunnelReconnectDelay(attempt); actual != expected {
-			t.Fatalf("attempt %d delay = %s, want %s", attempt, actual, expected)
-		}
 	}
 }
 
@@ -563,6 +553,38 @@ func TestOperatorTunnelEditValidatesBeforeStopAndRollsBackRuntimeFailure(t *test
 	}
 	if _, err := svc.StopOperatorSSHTunnel(context.Background(), original.ID, "admin-web"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOperatorTunnelEditReservesRollbackHostBeforeStop(t *testing.T) {
+	svc, transport, host := newTestService(t)
+	svc.limits.HostConcurrency = 1
+	other, err := svc.SaveHost(context.Background(), hostInputForTunnelTest("replacement", ""), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := svc.StartOperatorSSHTunnel(context.Background(), host.ID, domain.SSHTunnelConfig{RemotePort: 8080}, "app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := svc.acquire(context.Background(), host.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := svc.UpdateOperatorSSHTunnel(ctx, original.ID, other.ID, domain.SSHTunnelConfig{RemotePort: 9090}, "app"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("edit did not respect rollback host concurrency: %v", err)
+	}
+	list := svc.ListSSHTunnels()
+	if list.Count != 1 || list.Tunnels[0].ID != original.ID || list.Tunnels[0].Status != "running" {
+		t.Fatalf("waiting for host capacity disturbed original tunnel: %#v", list)
+	}
+	transport.mu.Lock()
+	defer transport.mu.Unlock()
+	if len(transport.tunnelSpecs) != 1 {
+		t.Fatalf("edit opened a tunnel before capacity was available: %d", len(transport.tunnelSpecs))
 	}
 }
 

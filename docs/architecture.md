@@ -28,6 +28,7 @@ App 控制面通过 loopback HTTP API 连接本地 Sidecar。`auth.password` 非
 - `internal/fileedit`：SSH 与 Workspace 共用的文本块规范化、展示 diff、审批载荷一致性检查和字节保留替换算法；不执行 I/O。
 - `internal/workspacefs`：按 Workspace 根目录解析路径、读取/搜索/枚举文件、生成预览、打开下载流、保存文本、暂存/提交编辑、上传落盘、目录创建和删除；不依赖 Service、Store 或 SSH。
 - `internal/workspaces`：管理 Workspace 根目录、注册快照、串行注册变更与注册目录生命周期；通过五个持久化方法直接使用 Store，不持有 Service、终端或审批状态。
+- `internal/sshtunnel`：进程内隧道登记、连接代次、TCP 转发、自动/手动重连、替换回滚及关闭等待；不依赖 Service、Store 或审批。
 - `internal/service`：审批状态机、摘要绑定、执行并发、任务、审计事务，以及外部 MCP Client Session 与动态工具生命周期。
 - `internal/store`：SQLite hosts、runs、approvals、events、chat、加密模型/MCP 配置与 Eino checkpoints。
 - `internal/agenttool`：Eino 与 MCP 共用的 Tool 输入契约、Schema、结果投影和 SSH/Workspace/Web/History 执行适配器。
