@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/Enterpr1se0/opsnerva/internal/config"
+	"github.com/Enterpr1se0/opsnerva/internal/mcpclient"
 	"github.com/Enterpr1se0/opsnerva/internal/security"
 	"github.com/Enterpr1se0/opsnerva/internal/skills"
 	"github.com/Enterpr1se0/opsnerva/internal/sshtunnel"
@@ -48,10 +49,11 @@ type Service struct {
 	explanationSem          chan struct{}
 	explanationSlots        chan struct{}
 	automaticApprovalSem    chan struct{}
-	mcpMu                   sync.RWMutex
-	mcpRuntime              map[string]*mcpRuntimeState
+	mcpClients              *mcpclient.Manager
 	mcpSecretsMu            sync.Mutex
 	mcpOAuthMu              sync.Mutex
+	mcpOAuthClosed          bool
+	mcpOAuthWG              sync.WaitGroup
 	mcpOAuthFlows           map[string]*mcpOAuthFlow
 	mcpOAuthByServer        map[string]*mcpOAuthFlow
 	mcpActivityMu           sync.Mutex
@@ -93,7 +95,7 @@ func New(st *store.Store, transport sshx.Transport, encryptor *security.Encrypto
 	result := &Service{
 		store: st, transport: transport, encryptor: encryptor, redactor: redactor, limits: limits,
 		workspaceSandboxPath: config.Default().WorkspaceSandboxPath,
-		globalSem:            make(chan struct{}, global), hostSems: make(map[string]chan struct{}), tasks: make(map[string]*taskState), approvalTasks: make(map[string]*taskState), taskSubscribers: make(map[string]map[uint64]*taskSubscriber), workspaces: workspaces.New(st), validators: make(map[string]config.Validator), mcpRuntime: make(map[string]*mcpRuntimeState),
+		globalSem:            make(chan struct{}, global), hostSems: make(map[string]chan struct{}), tasks: make(map[string]*taskState), approvalTasks: make(map[string]*taskState), taskSubscribers: make(map[string]map[uint64]*taskSubscriber), workspaces: workspaces.New(st), validators: make(map[string]config.Validator),
 		mcpOAuthFlows: make(map[string]*mcpOAuthFlow), mcpOAuthByServer: make(map[string]*mcpOAuthFlow),
 		mcpActivitySubscribers: make(map[uint64]*mcpActivitySubscriber),
 		modelMetadata:          newModelMetadataCache(modelsDevMetadataURL),
@@ -114,6 +116,7 @@ func New(st *store.Store, transport sshx.Transport, encryptor *security.Encrypto
 	}
 	tunnelTransport, _ := transport.(sshx.TunnelTransport)
 	result.tunnels = sshtunnel.New(tunnelTransport, result.resolveTunnelConnection, result.publishTunnelState, redactor)
+	result.mcpClients = mcpclient.New(redactor, result.observeMCPCall)
 	result.unsubscribeStoreChanges = st.SubscribeChanges(result.publishStoreChange)
 	return result
 }
@@ -123,6 +126,8 @@ func (s *Service) Store() *store.Store { return s.store }
 func (s *Service) Shutdown(ctx context.Context) error {
 	shellDone := s.shells.shutdown()
 	tunnelDone := s.tunnels.Close()
+	s.cancelAllMCPOAuthFlows()
+	mcpDone := s.mcpClients.Close()
 	s.executionMu.Lock()
 	if !s.executionClosed {
 		s.executionClosed = true
@@ -139,6 +144,8 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		s.executionWG.Wait()
 		<-shellDone
 		<-tunnelDone
+		<-mcpDone
+		s.mcpOAuthWG.Wait()
 		close(done)
 	}()
 	select {

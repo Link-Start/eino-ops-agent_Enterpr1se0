@@ -29,7 +29,8 @@ App 控制面通过 loopback HTTP API 连接本地 Sidecar。`auth.password` 非
 - `internal/workspacefs`：按 Workspace 根目录解析路径、读取/搜索/枚举文件、生成预览、打开下载流、保存文本、暂存/提交编辑、上传落盘、目录创建和删除；不依赖 Service、Store 或 SSH。
 - `internal/workspaces`：管理 Workspace 根目录、注册快照、串行注册变更与注册目录生命周期；通过五个持久化方法直接使用 Store，不持有 Service、终端或审批状态。
 - `internal/sshtunnel`：进程内隧道登记、连接代次、TCP 转发、自动/手动重连、替换回滚及关闭等待；不依赖 Service、Store 或审批。
-- `internal/service`：审批状态机、摘要绑定、执行并发、任务、审计事务，以及外部 MCP Client Session 与动态工具生命周期。
+- `internal/mcpclient`：外部 MCP 连接代次、stdio/Streamable HTTP Transport、工具发现与 Eino 适配、调用取消和关闭等待；不依赖 Service、Store 或审批。
+- `internal/service`：审批状态机、摘要绑定、执行并发、任务、审计事务，以及外部 MCP 配置、OAuth 授权与凭据持久化。
 - `internal/store`：SQLite hosts、runs、approvals、events、chat、加密模型/MCP 配置与 Eino checkpoints。
 - `internal/agenttool`：Eino 与 MCP 共用的 Tool 输入契约、Schema、结果投影和 SSH/Workspace/Web/History 执行适配器。
 - `internal/toolresult`：Service、Store 和 Skill 错误到模型/MCP 结构化结果的共享映射。
@@ -108,10 +109,25 @@ Service 保留活动终端检查、不可变 ID 输入约束、审计、能力�
 
 这一子阶段仍保留 Service 的权限、审批、审计和事件编排，不为了搬文件增加持有 Service 的运行时适配器。测试补齐确定性定时器测试、暂时/持续写失败、回调关闭等待、取消与重试预算隔离、积压上界、启动状态保存失败、建立期间 Shutdown、最终落盘错误上报以及元数据/事件游标隔离。
 
-后续按依赖顺序逐阶段推进，每阶段独立验证：
+第八阶段完成 Tunnel 运行时解耦。`Service` 只持有 `sshtunnel.Manager`；输入校验、审批、执行限流、当前连接配置解析/凭据解密及审计保留在 `service/tunnels.go`，旧 `tunnel_reconnect.go` 删除。Manager 接收已验证连接、按需读取当前连接的函数和现有状态事件发布函数，不持有 Service 或 Store。用户启动/编辑/停止继续不进入 Agent 审计；Agent 启动仍走原审批与 Run，开始和停止继续写审计。不存在的隧道由组件错误明确表示，HTTP 与模型结果分别映射为 404 和 `not_found`，不保留 Store 错误兼容别名。
 
-1. 分别收拢 Tunnel、外部 MCP Client 的运行时状态和关闭职责，保留用户交互与 Agent/MCP 审计的边界。
-2. 最后梳理 Execution、Approval、Task 的交叉调用，统一完成与取消路径，并分离业务状态更新和事件发布，再调整调用方装配。
+逻辑隧道持有 ID、端口、累计计数和手动重试信号；每次连接代次独占 SSH Client、Listener、转发连接集合与工作计数。停止先标记 stopping 并取消，等待 Accept、SSH Wait 和所有转发 worker 退出后才移除实例、发布最终事件和解除主机占用；调用方等待超时不等于后台清理完成。Shutdown 同时取消建立中和已启动的隧道，等待组件关闭屏障。反向 Listen 建立期间持续绑定取消；关闭代次先关闭 SSH，再关闭可能等待远端确认的反向 Listener，避免断网时卡在 cancel-tcpip-forward。
+
+自动重连保持原有 1–30 秒退避，每次重新解析主机及凭据；手动重试只唤醒同一 worker，保留 ID、已分配端口、开始时间和累计计数。旧代完全退出后才开启下一代，已取消实例不能发布迟到的连接错误或 running 状态。生命周期变更与事件入队有序，同步发布期间不持有登记或元数据锁；正常转发不重复推送相同 running 状态，流量继续由原控制面每 5 秒采样。编辑前验证目标并获取原/新主机的并发额度，同一原实例的停止和编辑串行执行；替换失败按当前原主机配置恢复原 ID，关闭过程中不再回滚创建。
+
+组件测试不需要数据库，覆盖退避和手动重试合并、旧代退出屏障、启动取消、反向关闭顺序、迟到连接回收、并发替换、累计流量及事件去重；Service 集成测试继续验证代理/凭据更新、审批和用户审计隔离、编辑预校验、失败回滚及主机并发额度。公开协议、SQL 和前端定时机制不变；主机删除检查与另一路启动不构成跨 Service/Store 的原子事务，本阶段未扩大为配置管理重构。
+
+第九阶段完成外部 MCP Client 运行时解耦。`mcpclient.Manager` 独立拥有连接登记、临时测试连接、会话、工具快照和后台工作计数；Service 不再保存 MCP Session map 或全局调用锁。配置 CRUD、校验和加密归 `mcp_config.go`，OAuth 浏览器流程与 Token 刷新/持久化分别归 `mcp_oauth.go`、`mcp_oauth_tokens.go`。HTTP、Agent 公开入口及对外 MCP Server Mode 不变；组件不持有 Service 或 Store，只通过不含参数/输出的调用结束观察函数交给 Service 记录审计。
+
+配置读取与连接代次预留在同一配置锁内完成，实际连接、发现和调用都在锁外执行。修改、禁用、删除与新重连取消该服务器的旧代次，包括尚未建立完的临时测试连接；迟到的成功会关闭旧 Session，迟到错误不能覆盖新状态。调用只在短锁内捕获当前 Session，单个慢工具不阻塞其他服务器或禁用/重连；旧模型工具每次仍通过 Manager 解析当前 ready 连接。SDK 会话结束后移除可用工具并标记 disconnected，不新增轮询、自动重连或工具重放。
+
+Shutdown 统一阻止新连接，取消并等待建立中连接、会话 Wait、在途调用及其审计，同时取消并等待 OAuth 协程；原单独的 `CloseMCPServers` 入口删除，应用初始化失败也按相同顺序先关闭 Service/Transport，再关闭 Store。SDK 会话 Close 会先等待远端 DELETE；该清理请求独立限制为 2 秒，防止远端未结束任务拖住本地取消，正常连接与调用仍保持原 20/90 秒设置。远端是否执行完操作仍可能未知，取消不保证远端副作用回滚，也不自动重试。
+
+OAuth 刷新绑定连接生命周期，不随发起授权/重连的 HTTP 请求结束而失效；写回凭据时在配置锁内复核代次，过期流程不能恢复已清除或修改后的凭据。取消中的外部调用仍用保留会话信息、独立有界的 context 写一次调用审计，连接变化不伪装成整个 Agent 轮次被取消。Schema、命名、分页、完整结果与不可信标记沿用现有 officialmcp 适配；发现结束后工具不再保留旧发现 Session。
+
+组件测试覆盖迟到连接、并发禁用/调用、关闭等待、临时连接隔离、快照拷贝、连接退出与发现约束；真实 HTTP 集成验证调用取消及审计、建立期间禁用、OAuth 授权关闭、Token 刷新生命周期与过期写回。未改 SQL、前端订阅或外部 MCP 工具审批边界。
+
+后续阶段：梳理 Execution、Approval、Task 的交叉调用，统一完成与取消路径，并分离业务状态更新和事件发布，再调整调用方装配。每阶段独立验证。
 
 ## Dynamic extensions
 
@@ -121,7 +137,7 @@ Skill Registry 位于控制面数据目录，每个 Skill 目录必须包含 `SK
 
 外部 MCP 配置保存在 `mcp_servers`。command、args、cwd、URL 和秘密键名是可管理元数据；环境变量、HTTP Header、OAuth 动态客户端凭据及 Token 整体使用 AES-256-GCM 加密。Streamable HTTP OAuth 使用授权服务器发现、动态客户端注册、PKCE 和 refresh token；回调 state 与待完成流程只存在内存，修改 Endpoint 时删除原 OAuth 会话。启动时 Service 尝试连接所有 enabled 配置；单个服务器失败只记录 `error` 状态和结构化日志，不阻止控制面启动。
 
-stdio 通过 `exec.Command(command,args...)` 启动，不解析 Shell；Streamable HTTP 使用官方 MCP Go SDK transport。连接成功后分页执行 `tools/list`，把服务器 JSON Schema 转为 Eino ToolInfo，并生成不超过模型限制的稳定名称 `mcp__<server-id-hash>__<sanitized-tool-name>`。动态 wrapper 每次调用都重新检查服务器的 ready Session，因此 Disable/Delete/重连失败会立即阻止旧 Runner 中的残留句柄；随后 Runtime 热重载会从模型函数 Schema 中移除它。调用结果限制为 128 KiB，并记录不含参数或输出的 `mcp_tool_called` 审计事件。
+stdio 通过 `exec.Command(command,args...)` 启动，不解析 Shell；Streamable HTTP 使用官方 MCP Go SDK transport。连接成功后分页执行 `tools/list`，把服务器 JSON Schema 转为 Eino ToolInfo，并生成不超过模型限制的稳定名称 `mcp__<server-id-hash>__<sanitized-tool-name>`。动态 wrapper 每次调用都重新检查服务器的 ready Session，因此 Disable/Delete/重连失败会立即阻止旧 Runner 中的残留句柄；随后 Runtime 热重载会从模型函数 Schema 中移除它。调用保留完整结果与不可信标记，并记录不含参数或输出的 `mcp_tool_called` 审计事件。
 
 ## Command execution
 

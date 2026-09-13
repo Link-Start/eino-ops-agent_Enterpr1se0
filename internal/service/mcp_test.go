@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -19,25 +18,8 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-type staticMCPClientSession struct {
-	tools []*mcp.Tool
-	pages map[string]*mcp.ListToolsResult
-}
-
-func (s *staticMCPClientSession) ListTools(_ context.Context, params *mcp.ListToolsParams) (*mcp.ListToolsResult, error) {
-	if s.pages != nil {
-		return s.pages[params.Cursor], nil
-	}
-	return &mcp.ListToolsResult{Tools: s.tools}, nil
-}
-
-func (s *staticMCPClientSession) CallTool(context.Context, *mcp.CallToolParams) (*mcp.CallToolResult, error) {
-	return nil, nil
-}
-
 func TestManagedMCPServerInjectsNamespacedToolAndCanBeDisabled(t *testing.T) {
 	svc, _, _ := newTestService(t)
-	t.Cleanup(svc.CloseMCPServers)
 	remote := mcp.NewServer(&mcp.Implementation{Name: "fixture", Version: "1.0.0"}, nil)
 	type echoInput struct {
 		Message string `json:"message" jsonschema:"message to echo"`
@@ -114,7 +96,6 @@ func TestManagedMCPServerInjectsNamespacedToolAndCanBeDisabled(t *testing.T) {
 
 func TestMCPToolErrorReturnsOfficialResultWithSecurityMetadata(t *testing.T) {
 	svc, _, _ := newTestService(t)
-	t.Cleanup(svc.CloseMCPServers)
 	remote := mcp.NewServer(&mcp.Implementation{Name: "fixture", Version: "1.0.0"}, nil)
 	mcp.AddTool(remote, &mcp.Tool{Name: "always_fail", Description: "Return a tool-level error."},
 		func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, any, error) {
@@ -172,70 +153,6 @@ func TestMCPToolErrorReturnsOfficialResultWithSecurityMetadata(t *testing.T) {
 	}
 }
 
-func TestOfficialMCPToolDiscoveryKeepsSafetyLimitsAndUniqueNames(t *testing.T) {
-	svc, _, _ := newTestService(t)
-	tools := make([]*mcp.Tool, 0, mcpMaxTools+2)
-	tools = append(tools,
-		&mcp.Tool{Name: "same.name", Description: "first", InputSchema: map[string]any{"type": "object"}},
-		&mcp.Tool{Name: "same name", Description: "second", InputSchema: map[string]any{"type": "object"}},
-	)
-	for index := 2; index < mcpMaxTools+2; index++ {
-		tools = append(tools, &mcp.Tool{Name: fmt.Sprintf("tool_%03d", index), InputSchema: map[string]any{"type": "object"}})
-	}
-	resolved, err := svc.resolveMCPTools(context.Background(), &staticMCPClientSession{tools: tools}, domain.MCPServer{ID: "server-limits", Name: "Limits"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(resolved) != mcpMaxTools {
-		t.Fatalf("resolved MCP tools=%d, want %d", len(resolved), mcpMaxTools)
-	}
-	first, err := resolved[0].Info(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := resolved[1].Info(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first.Name == second.Name || len(first.Name) > 64 || len(second.Name) > 64 {
-		t.Fatalf("colliding MCP names were not mapped safely: %q %q", first.Name, second.Name)
-	}
-	if first.Extra[officialmcp.ExtraMCPServerName] != "Limits" || first.Extra[officialmcp.ExtraMCPRawToolName] != "same.name" {
-		t.Fatalf("official MCP metadata is incomplete: %#v", first.Extra)
-	}
-}
-
-func TestOfficialMCPToolDiscoveryLoadsAllPages(t *testing.T) {
-	svc, _, _ := newTestService(t)
-	session := &staticMCPClientSession{pages: map[string]*mcp.ListToolsResult{
-		"": {
-			Tools:      []*mcp.Tool{{Name: "first", InputSchema: map[string]any{"type": "object"}}},
-			NextCursor: "next",
-		},
-		"next": {
-			Tools: []*mcp.Tool{{Name: "second", InputSchema: map[string]any{"type": "object"}}},
-		},
-	}}
-	resolved, err := svc.resolveMCPTools(context.Background(), session, domain.MCPServer{ID: "server-pages", Name: "Pages"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(resolved) != 2 {
-		t.Fatalf("resolved paginated MCP tools=%d, want 2", len(resolved))
-	}
-}
-
-func TestOfficialMCPToolDiscoveryRejectsOversizedSchema(t *testing.T) {
-	svc, _, _ := newTestService(t)
-	session := &staticMCPClientSession{tools: []*mcp.Tool{{
-		Name: "oversized", InputSchema: map[string]any{"type": "object", "description": strings.Repeat("x", mcpMaxSchemaBytes)},
-	}}}
-	_, err := svc.resolveMCPTools(context.Background(), session, domain.MCPServer{ID: "server-schema", Name: "Schema"})
-	if err == nil || !strings.Contains(err.Error(), "input schema exceeds") {
-		t.Fatalf("oversized MCP schema error=%v", err)
-	}
-}
-
 func TestMCPServerEditPreservesEncryptedSecretsWhenOmitted(t *testing.T) {
 	svc, _, _ := newTestService(t)
 	created, err := svc.SaveMCPServer(context.Background(), domain.MCPServerInput{
@@ -267,7 +184,6 @@ func TestMCPServerEditPreservesEncryptedSecretsWhenOmitted(t *testing.T) {
 
 func TestManagedMCPServerOAuthAuthorizationPersistsAndClearsSession(t *testing.T) {
 	svc, _, _ := newTestService(t)
-	t.Cleanup(svc.CloseMCPServers)
 	remote := mcp.NewServer(&mcp.Implementation{Name: "oauth-fixture", Version: "1.0.0"}, nil)
 	mcp.AddTool(remote, &mcp.Tool{Name: "oauth_echo", Description: "OAuth fixture."},
 		func(_ context.Context, _ *mcp.CallToolRequest, input struct {
@@ -355,7 +271,7 @@ func TestManagedMCPServerOAuthAuthorizationPersistsAndClearsSession(t *testing.T
 		t.Fatalf("OAuth session was not encrypted and restored: %#v err=%v", secrets.OAuth, err)
 	}
 
-	svc.disconnectMCPServer(server.ID, "disconnected")
+	svc.mcpClients.Disconnect(server.ID, "disconnected")
 	if err := svc.ReconnectMCPServer(context.Background(), server.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -370,5 +286,25 @@ func TestManagedMCPServerOAuthAuthorizationPersistsAndClearsSession(t *testing.T
 	}
 	if cleared.OAuthConfigured || cleared.Status != "error" {
 		t.Fatalf("cleared OAuth state = %#v", cleared)
+	}
+	// Shutdown joins an authorization flow still waiting for the browser.
+	start, err = svc.BeginMCPOAuth(context.Background(), server.ID, "http://127.0.0.1:8080/api/v1/mcp/oauth/callback", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer shutdownCancel()
+	if err := svc.Shutdown(shutdownCtx); err != nil {
+		t.Fatal(err)
+	}
+	if len(svc.MCPTools()) != 0 {
+		t.Fatal("shutdown retained MCP tools")
+	}
+	if _, err := svc.BeginMCPOAuth(context.Background(), server.ID, "http://127.0.0.1:8080/api/v1/mcp/oauth/callback", "test"); err == nil {
+		t.Fatal("shutdown accepted a new OAuth flow")
+	}
+	authorizationURL, _ = url.Parse(start.AuthorizationURL)
+	if err := svc.CompleteMCPOAuth(context.Background(), authorizationURL.Query().Get("state"), "late-code", "", ""); err == nil {
+		t.Fatal("shutdown accepted a late OAuth callback")
 	}
 }

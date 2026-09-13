@@ -1,118 +1,17 @@
 package service
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"regexp"
-	"sort"
-	"strings"
 	"time"
 
 	"github.com/Enterpr1se0/opsnerva/internal/domain"
+	"github.com/Enterpr1se0/opsnerva/internal/mcpclient"
 	"github.com/Enterpr1se0/opsnerva/internal/observability"
-	"github.com/Enterpr1se0/opsnerva/internal/proxyx"
-
-	officialmcp "github.com/cloudwego/eino-ext/components/tool/mcp/officialmcp"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/modelcontextprotocol/go-sdk/auth"
-	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
-
-const (
-	mcpConnectTimeout = 20 * time.Second
-	mcpCallTimeout    = 90 * time.Second
-	mcpMaxSchemaBytes = 256 << 10
-	mcpMaxTools       = 128
-)
-
-var (
-	mcpEnvNameRE  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
-	mcpToolNameRE = regexp.MustCompile(`[^A-Za-z0-9_-]+`)
-)
-
-type mcpSecrets struct {
-	Env     map[string]string `json:"env,omitempty"`
-	Headers map[string]string `json:"headers,omitempty"`
-	OAuth   *mcpOAuthSession  `json:"oauth,omitempty"`
-}
-
-type mcpRuntimeState struct {
-	status      string
-	lastError   string
-	connectedAt *time.Time
-	session     *mcp.ClientSession
-	tools       []tool.BaseTool
-}
-
-type mcpClientSessionAdapter struct {
-	service          *Service
-	serverID         string
-	serverName       string
-	discoverySession officialmcp.ClientSession
-	discoveredTools  int
-}
-
-func (a *mcpClientSessionAdapter) ListTools(ctx context.Context, params *mcp.ListToolsParams) (*mcp.ListToolsResult, error) {
-	if a.discoverySession == nil {
-		return nil, fmt.Errorf("MCP discovery session is not ready")
-	}
-	response, err := a.discoverySession.ListTools(ctx, params)
-	if err != nil {
-		return nil, err
-	}
-	if response == nil {
-		return nil, fmt.Errorf("MCP server returned an empty tool list")
-	}
-	filtered := *response
-	filtered.Tools = make([]*mcp.Tool, 0, len(response.Tools))
-	for _, candidate := range response.Tools {
-		if a.discoveredTools >= mcpMaxTools {
-			filtered.NextCursor = ""
-			break
-		}
-		if candidate == nil || strings.TrimSpace(candidate.Name) == "" {
-			continue
-		}
-		copyOfTool := *candidate
-		if copyOfTool.InputSchema == nil {
-			copyOfTool.InputSchema = map[string]any{"type": "object"}
-		}
-		encodedSchema, err := json.Marshal(copyOfTool.InputSchema)
-		if err != nil {
-			return nil, fmt.Errorf("encode MCP tool %q input schema: %w", candidate.Name, err)
-		}
-		if len(encodedSchema) > mcpMaxSchemaBytes {
-			return nil, fmt.Errorf("MCP tool %q input schema exceeds %d bytes", candidate.Name, mcpMaxSchemaBytes)
-		}
-		description := strings.TrimSpace(copyOfTool.Description)
-		if description == "" {
-			description = copyOfTool.Name
-		}
-		copyOfTool.Description = fmt.Sprintf("%s: %s", a.serverName, strings.ToValidUTF8(description, "�"))
-		filtered.Tools = append(filtered.Tools, &copyOfTool)
-		a.discoveredTools++
-	}
-	if a.discoveredTools >= mcpMaxTools {
-		filtered.NextCursor = ""
-	}
-	return &filtered, nil
-}
-
-func (a *mcpClientSessionAdapter) CallTool(ctx context.Context, params *mcp.CallToolParams) (*mcp.CallToolResult, error) {
-	if a.service == nil {
-		return nil, fmt.Errorf("MCP service is not ready")
-	}
-	return a.service.callMCPTool(ctx, a.serverID, params)
-}
 
 func (s *Service) InitializeMCPServers(ctx context.Context) error {
 	servers, err := s.store.ListMCPServers(ctx)
@@ -121,7 +20,7 @@ func (s *Service) InitializeMCPServers(ctx context.Context) error {
 	}
 	for _, server := range servers {
 		if !server.Enabled {
-			s.setMCPRuntime(server.ID, &mcpRuntimeState{status: "disabled"})
+			s.mcpClients.Disconnect(server.ID, "disabled")
 			continue
 		}
 		if err := s.ReconnectMCPServer(ctx, server.ID); err != nil {
@@ -129,94 +28,6 @@ func (s *Service) InitializeMCPServers(ctx context.Context) error {
 		}
 	}
 	return nil
-}
-
-func (s *Service) CloseMCPServers() {
-	s.cancelAllMCPOAuthFlows()
-	s.mcpMu.Lock()
-	states := s.mcpRuntime
-	s.mcpRuntime = make(map[string]*mcpRuntimeState)
-	s.mcpMu.Unlock()
-	for _, state := range states {
-		if state != nil && state.session != nil {
-			_ = state.session.Close()
-		}
-	}
-}
-
-func (s *Service) SaveMCPServer(ctx context.Context, input domain.MCPServerInput, actor string) (domain.MCPServer, error) {
-	input.ID = strings.TrimSpace(input.ID)
-	input.Name = strings.TrimSpace(input.Name)
-	input.Command = strings.TrimSpace(input.Command)
-	input.Cwd = strings.TrimSpace(input.Cwd)
-	input.URL = strings.TrimSpace(input.URL)
-	if err := validateMCPInput(input); err != nil {
-		return domain.MCPServer{}, err
-	}
-	if input.ID != "" {
-		s.cancelMCPOAuthFlow(input.ID)
-	}
-
-	s.mcpSecretsMu.Lock()
-	saved, err := s.storeMCPServerConfig(ctx, input)
-	s.mcpSecretsMu.Unlock()
-	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "unique constraint") {
-			return domain.MCPServer{}, fmt.Errorf("MCP server name already exists")
-		}
-		return domain.MCPServer{}, err
-	}
-	if saved.Enabled {
-		_ = s.ReconnectMCPServer(ctx, saved.ID)
-	} else {
-		s.disconnectMCPServer(saved.ID, "disabled")
-	}
-	s.audit(ctx, "", "mcp_server_saved", actor, map[string]any{"server_id": saved.ID, "name": saved.Name, "transport": saved.Transport, "enabled": saved.Enabled})
-	return s.GetMCPServer(ctx, saved.ID)
-}
-
-func (s *Service) storeMCPServerConfig(ctx context.Context, input domain.MCPServerInput) (domain.MCPServer, error) {
-	server := domain.MCPServer{
-		ID: input.ID, Name: input.Name, Transport: input.Transport, Command: input.Command,
-		Args: append([]string(nil), input.Args...), Cwd: input.Cwd, URL: input.URL, Enabled: input.Enabled,
-	}
-	secrets := mcpSecrets{Env: map[string]string{}, Headers: map[string]string{}}
-	if input.ID != "" {
-		existing, err := s.store.GetMCPServer(ctx, input.ID)
-		if err != nil {
-			return domain.MCPServer{}, err
-		}
-		server.CreatedAt = existing.CreatedAt
-		server.SecretsCipher = existing.SecretsCipher
-		secrets, err = s.decryptMCPSecrets(existing.SecretsCipher)
-		if err != nil {
-			return domain.MCPServer{}, fmt.Errorf("decrypt existing MCP secrets: %w", err)
-		}
-		if existing.Transport != input.Transport || existing.URL != input.URL {
-			secrets.OAuth = nil
-		}
-	}
-	if input.Env != nil {
-		secrets.Env = cloneStringMap(input.Env)
-	}
-	if input.Headers != nil {
-		secrets.Headers = cloneStringMap(input.Headers)
-	}
-	if err := validateMCPSecrets(secrets); err != nil {
-		return domain.MCPServer{}, err
-	}
-	server.EnvKeys = sortedMapKeys(secrets.Env)
-	server.HeaderKeys = sortedMapKeys(secrets.Headers)
-	payload, err := json.Marshal(secrets)
-	if err != nil {
-		return domain.MCPServer{}, err
-	}
-	server.SecretsCipher, err = s.encryptor.Encrypt(payload)
-	if err != nil {
-		return domain.MCPServer{}, err
-	}
-	saved, err := s.store.UpsertMCPServer(ctx, server)
-	return saved, err
 }
 
 func (s *Service) ListMCPServers(ctx context.Context) ([]domain.MCPServer, error) {
@@ -239,18 +50,21 @@ func (s *Service) GetMCPServer(ctx context.Context, id string) (domain.MCPServer
 }
 
 func (s *Service) SetMCPServerEnabled(ctx context.Context, id string, enabled bool, actor string) (domain.MCPServer, error) {
+	s.mcpSecretsMu.Lock()
 	server, err := s.store.GetMCPServer(ctx, id)
-	if err != nil {
-		return domain.MCPServer{}, err
+	if err == nil {
+		err = s.store.SetMCPServerEnabled(ctx, id, enabled)
 	}
-	if err := s.store.SetMCPServerEnabled(ctx, id, enabled); err != nil {
+	if err == nil && !enabled {
+		s.cancelMCPOAuthFlow(id)
+		s.mcpClients.Disconnect(id, "disabled")
+	}
+	s.mcpSecretsMu.Unlock()
+	if err != nil {
 		return domain.MCPServer{}, err
 	}
 	if enabled {
 		_ = s.ReconnectMCPServer(ctx, id)
-	} else {
-		s.cancelMCPOAuthFlow(id)
-		s.disconnectMCPServer(id, "disabled")
 	}
 	eventType := "mcp_server_disabled"
 	if enabled {
@@ -261,265 +75,95 @@ func (s *Service) SetMCPServerEnabled(ctx context.Context, id string, enabled bo
 }
 
 func (s *Service) DeleteMCPServer(ctx context.Context, id, actor string) error {
+	s.mcpSecretsMu.Lock()
 	server, err := s.store.GetMCPServer(ctx, id)
+	if err == nil {
+		err = s.store.DeleteMCPServer(ctx, id)
+	}
+	if err == nil {
+		s.cancelMCPOAuthFlow(id)
+		s.mcpClients.Forget(id)
+	}
+	s.mcpSecretsMu.Unlock()
 	if err != nil {
 		return err
 	}
-	s.cancelMCPOAuthFlow(id)
-	s.disconnectMCPServer(id, "disabled")
-	if err := s.store.DeleteMCPServer(ctx, id); err != nil {
-		return err
-	}
-	s.mcpMu.Lock()
-	delete(s.mcpRuntime, id)
-	s.mcpMu.Unlock()
 	s.audit(ctx, "", "mcp_server_deleted", actor, map[string]any{"server_id": id, "name": server.Name})
 	return nil
 }
 
 func (s *Service) ReconnectMCPServer(ctx context.Context, id string) error {
-	server, err := s.store.GetMCPServer(ctx, id)
+	connectCtx, cancel := context.WithTimeout(ctx, mcpclient.ConnectTimeout)
+	defer cancel()
+	// Config reads and generation reservation share the same lock as writes.
+	// No network operation runs while it is held.
+	s.mcpSecretsMu.Lock()
+	server, err := s.store.GetMCPServer(connectCtx, id)
+	var connection *mcpclient.Connection
+	if err == nil && !server.Enabled {
+		err = fmt.Errorf("MCP server is disabled")
+	}
+	if err == nil {
+		s.cancelMCPOAuthFlow(id)
+		connection, err = s.mcpClients.Begin(connectCtx, id)
+	}
+	s.mcpSecretsMu.Unlock()
 	if err != nil {
 		return err
 	}
-	if !server.Enabled {
-		return fmt.Errorf("MCP server is disabled")
-	}
-	s.mcpMu.Lock()
-	previous := s.mcpRuntime[id]
-	s.mcpRuntime[id] = &mcpRuntimeState{status: "connecting"}
-	s.mcpMu.Unlock()
-	if previous != nil && previous.session != nil {
-		_ = previous.session.Close()
-	}
-
 	started := time.Now()
-	connectCtx, cancel := context.WithTimeout(ctx, mcpConnectTimeout)
-	defer cancel()
-	session, tools, err := s.connectMCPServer(connectCtx, server)
+	err = connection.Run(s.openMCPConnection(server, connection))
 	if err != nil {
-		s.setMCPRuntime(id, &mcpRuntimeState{status: "error", lastError: err.Error()})
 		observability.FromContext(ctx).ErrorContext(ctx, "MCP server connection failed", "component", "mcp_client", "server_id", id, "server_name", server.Name, "transport", server.Transport, "duration_ms", time.Since(started).Milliseconds(), "error", err)
 		return err
 	}
-	now := time.Now().UTC()
-	s.setMCPRuntime(id, &mcpRuntimeState{status: "ready", connectedAt: &now, session: session, tools: tools})
-	observability.FromContext(ctx).InfoContext(ctx, "MCP server ready", "component", "mcp_client", "server_id", id, "server_name", server.Name, "transport", server.Transport, "tool_count", len(tools), "duration_ms", time.Since(started).Milliseconds())
+	observability.FromContext(ctx).InfoContext(ctx, "MCP server ready", "component", "mcp_client", "server_id", id, "server_name", server.Name, "transport", server.Transport, "tool_count", len(s.mcpClients.Snapshot(id).Tools), "duration_ms", time.Since(started).Milliseconds())
 	return nil
 }
 
 func (s *Service) TestMCPServer(ctx context.Context, id string) (domain.MCPTestResult, error) {
-	server, err := s.store.GetMCPServer(ctx, id)
-	if err != nil {
-		return domain.MCPTestResult{}, err
-	}
-	started := time.Now()
-	testCtx, cancel := context.WithTimeout(ctx, mcpConnectTimeout)
+	testCtx, cancel := context.WithTimeout(ctx, mcpclient.ConnectTimeout)
 	defer cancel()
-	session, tools, err := s.connectMCPServer(testCtx, server)
+	s.mcpSecretsMu.Lock()
+	server, err := s.store.GetMCPServer(testCtx, id)
+	var connection *mcpclient.Connection
+	if err == nil {
+		connection, err = s.mcpClients.BeginTest(testCtx, id)
+	}
+	s.mcpSecretsMu.Unlock()
 	if err != nil {
 		return domain.MCPTestResult{}, err
 	}
-	defer session.Close()
-	return domain.MCPTestResult{OK: true, LatencyMS: time.Since(started).Milliseconds(), ToolCount: len(tools), Tools: publicMCPTools(tools)}, nil
+	return connection.Test(s.openMCPConnection(server, connection))
 }
 
-func (s *Service) MCPTools() []tool.BaseTool {
-	s.mcpMu.RLock()
-	defer s.mcpMu.RUnlock()
-	result := make([]tool.BaseTool, 0)
-	for _, state := range s.mcpRuntime {
-		if state == nil || state.status != "ready" || state.session == nil {
-			continue
-		}
-		result = append(result, state.tools...)
-	}
-	sort.Slice(result, func(i, j int) bool {
-		left, _ := result[i].Info(context.Background())
-		right, _ := result[j].Info(context.Background())
-		return left.Name < right.Name
+func (s *Service) MCPTools() []tool.BaseTool { return s.mcpClients.Tools() }
+
+func (s *Service) observeMCPCall(ctx context.Context, info mcpclient.CallInfo) {
+	auditCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	s.audit(auditCtx, "", "mcp_tool_called", "eino-agent", map[string]any{
+		"server_id": info.ServerID, "tool_name": info.ToolName, "status": info.Status,
+		"duration_ms": info.Duration.Milliseconds(), "session_id": SessionIDFromContext(ctx),
 	})
-	return result
 }
 
-func (s *Service) callMCPTool(ctx context.Context, serverID string, params *mcp.CallToolParams) (*mcp.CallToolResult, error) {
-	if params == nil || strings.TrimSpace(params.Name) == "" {
-		return nil, fmt.Errorf("MCP tool name is required")
-	}
-	callParams := *params
-	if raw, ok := callParams.Arguments.(json.RawMessage); ok {
-		raw = json.RawMessage(bytes.TrimSpace(raw))
-		if len(raw) == 0 {
-			raw = json.RawMessage(`{}`)
-		}
-		if !json.Valid(raw) {
-			return nil, fmt.Errorf("invalid MCP tool arguments")
-		}
-		callParams.Arguments = raw
-	}
-	started := time.Now()
-	s.mcpMu.RLock()
-	state := s.mcpRuntime[serverID]
-	if state == nil || state.status != "ready" || state.session == nil {
-		s.mcpMu.RUnlock()
-		return nil, fmt.Errorf("MCP server is not ready")
-	}
-	callCtx := ctx
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-		var cancel context.CancelFunc
-		callCtx, cancel = context.WithTimeout(ctx, mcpCallTimeout)
-		defer cancel()
-	}
-	result, err := state.session.CallTool(callCtx, &callParams)
-	s.mcpMu.RUnlock()
-	status := "completed"
-	if err != nil {
-		status = "failed"
-	} else if result == nil {
-		status = "failed"
-		err = fmt.Errorf("MCP server returned an empty tool result")
-	} else if result.IsError {
-		status = "tool_error"
-	}
-	s.audit(ctx, "", "mcp_tool_called", "eino-agent", map[string]any{
-		"server_id": serverID, "tool_name": callParams.Name, "status": status, "duration_ms": time.Since(started).Milliseconds(), "session_id": SessionIDFromContext(ctx),
-	})
-	if err != nil {
-		return nil, err
-	}
-	return result, nil
-}
-
-func (s *Service) connectMCPServer(ctx context.Context, server domain.MCPServer) (*mcp.ClientSession, []tool.BaseTool, error) {
-	secrets, err := s.decryptMCPSecrets(server.SecretsCipher)
-	if err != nil {
-		return nil, nil, fmt.Errorf("decrypt MCP secrets: %w", err)
-	}
-	var oauthHandler auth.OAuthHandler
-	if server.Transport == domain.MCPTransportStreamableHTTP && secrets.OAuth != nil {
-		oauthClient := &http.Client{Timeout: mcpCallTimeout, Transport: http.DefaultTransport}
-		oauthHandler, err = s.restoredMCPOAuthHandler(server.ID, secrets.OAuth, oauthClient)
+func (s *Service) openMCPConnection(server domain.MCPServer, connection *mcpclient.Connection) mcpclient.Open {
+	return func(ctx context.Context) (mcpclient.Session, []tool.BaseTool, error) {
+		secrets, err := s.decryptMCPSecrets(server.SecretsCipher)
 		if err != nil {
-			return nil, nil, fmt.Errorf("restore MCP OAuth session: %w", err)
+			return nil, nil, fmt.Errorf("decrypt MCP secrets: %w", err)
 		}
-	}
-	return s.connectMCPServerWithSecrets(ctx, server, secrets, oauthHandler)
-}
-
-func (s *Service) connectMCPServerWithSecrets(ctx context.Context, server domain.MCPServer, secrets mcpSecrets, oauthHandler auth.OAuthHandler) (*mcp.ClientSession, []tool.BaseTool, error) {
-	var transport mcp.Transport
-	switch server.Transport {
-	case domain.MCPTransportStdio:
-		command := exec.Command(server.Command, server.Args...)
-		command.Dir = server.Cwd
-		command.Env = append(os.Environ(), mapAsEnvironment(secrets.Env)...)
-		transport = &mcp.CommandTransport{Command: command}
-	case domain.MCPTransportStreamableHTTP:
-		client := mcpResourceHTTPClient(secrets.Headers, oauthHandler != nil)
-		return s.connectMCPServerWithTransport(ctx, server, client, oauthHandler)
-	default:
-		return nil, nil, fmt.Errorf("unsupported MCP transport %q", server.Transport)
-	}
-	client := mcp.NewClient(&mcp.Implementation{Name: "opsnerva", Version: "0.1.0"}, nil)
-	session, err := client.Connect(ctx, transport, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	resolved, err := s.resolveMCPTools(ctx, session, server)
-	if err != nil {
-		_ = session.Close()
-		return nil, nil, err
-	}
-	return session, resolved, nil
-}
-
-func (s *Service) connectMCPServerWithTransport(ctx context.Context, server domain.MCPServer, client *http.Client, oauthHandler auth.OAuthHandler) (*mcp.ClientSession, []tool.BaseTool, error) {
-	transport := &mcp.StreamableClientTransport{
-		Endpoint: server.URL, HTTPClient: client, OAuthHandler: oauthHandler,
-		MaxRetries: 1, DisableStandaloneSSE: true,
-	}
-	mcpClient := mcp.NewClient(&mcp.Implementation{Name: "opsnerva", Version: "0.1.0"}, nil)
-	session, err := mcpClient.Connect(ctx, transport, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	resolved, err := s.resolveMCPTools(ctx, session, server)
-	if err != nil {
-		_ = session.Close()
-		return nil, nil, err
-	}
-	return session, resolved, nil
-}
-
-func mcpResourceHTTPClient(headers map[string]string, oauthEnabled bool) *http.Client {
-	fixed := cloneStringMap(headers)
-	if oauthEnabled {
-		for name := range fixed {
-			if strings.EqualFold(name, "Authorization") {
-				delete(fixed, name)
+		var handler auth.OAuthHandler
+		if server.Transport == domain.MCPTransportStreamableHTTP && secrets.OAuth != nil {
+			oauthClient := &http.Client{Timeout: mcpclient.CallTimeout, Transport: http.DefaultTransport}
+			handler, err = s.restoredMCPOAuthHandler(server.ID, secrets.OAuth, oauthClient, connection)
+			if err != nil {
+				return nil, nil, fmt.Errorf("restore MCP OAuth session: %w", err)
 			}
 		}
+		return s.mcpClients.Open(ctx, mcpclient.Config{Server: server, Env: secrets.Env, Headers: secrets.Headers, OAuth: handler})
 	}
-	return &http.Client{
-		Timeout:   mcpCallTimeout,
-		Transport: proxyx.HeaderRewriteTransport{Base: http.DefaultTransport, Headers: fixed},
-	}
-}
-
-func (s *Service) resolveMCPTools(ctx context.Context, session officialmcp.ClientSession, server domain.MCPServer) ([]tool.BaseTool, error) {
-	adapter := &mcpClientSessionAdapter{
-		service: s, serverID: server.ID, serverName: server.Name, discoverySession: session,
-	}
-	errorAsError := false
-	seen := make(map[string]struct{})
-	return officialmcp.GetTools(ctx, &officialmcp.Config{
-		Cli:           adapter,
-		ServerName:    server.Name,
-		ListToolsMode: officialmcp.ListToolsAllPages,
-		MaxToolPages:  100,
-		ToolNameMapper: func(_ context.Context, input officialmcp.ToolNameMapperInput) (officialmcp.ToolNameMapperOutput, error) {
-			exposed := exposedMCPToolName(server.ID, input.Tool.Name)
-			if _, exists := seen[exposed]; exists {
-				digest := sha256.Sum256([]byte(input.Tool.Name))
-				exposed = truncateToolName(exposed, 55) + "_" + hex.EncodeToString(digest[:4])
-			}
-			seen[exposed] = struct{}{}
-			return officialmcp.ToolNameMapperOutput{ExposedName: exposed}, nil
-		},
-		MetadataMode:      officialmcp.MetadataBasic,
-		DescriptionPolicy: &officialmcp.DescriptionPolicy{MaxChars: 1000},
-		ResultPolicy: &officialmcp.ResultPolicy{
-			IncludeStructuredContent: true,
-			IncludeMeta:              true,
-			ErrorAsError:             &errorAsError,
-		},
-		ToolCallResultHandlerV2: markMCPToolResultUntrusted,
-	})
-}
-
-func markMCPToolResultUntrusted(_ context.Context, _ officialmcp.ToolCallInfo, result *mcp.CallToolResult) (*mcp.CallToolResult, error) {
-	if result == nil {
-		return nil, nil
-	}
-	copyOfResult := *result
-	copyOfResult.Meta = make(mcp.Meta, len(result.Meta)+1)
-	for key, value := range result.Meta {
-		copyOfResult.Meta[key] = value
-	}
-	security := map[string]any{
-		"content_is_untrusted": true,
-		"ok":                   !result.IsError,
-		"status":               "completed",
-		"code":                 "completed",
-	}
-	if result.IsError {
-		security["status"] = "failed"
-		security["code"] = "provider_failed"
-		security["message"] = "the external MCP function tool returned an error"
-		security["next_action"] = "inspect the returned error and external state; do not repeat the same call unchanged"
-	}
-	copyOfResult.Meta["opsnerva"] = security
-	return &copyOfResult, nil
 }
 
 func (s *Service) decorateMCPServer(server domain.MCPServer) domain.MCPServer {
@@ -530,16 +174,10 @@ func (s *Service) decorateMCPServer(server domain.MCPServer) domain.MCPServer {
 			server.OAuthExpiresAt = &expiresAt
 		}
 	}
-	s.mcpMu.RLock()
-	state := s.mcpRuntime[server.ID]
-	if state != nil {
-		server.Status = state.status
-		server.LastError = state.lastError
-		server.ConnectedAt = state.connectedAt
-		server.Tools = publicMCPTools(state.tools)
-		server.ToolCount = len(server.Tools)
-	}
-	s.mcpMu.RUnlock()
+	state := s.mcpClients.Snapshot(server.ID)
+	server.Status, server.LastError, server.ConnectedAt = state.Status, state.LastError, state.ConnectedAt
+	server.Tools = state.Tools
+	server.ToolCount = len(state.Tools)
 	if server.Status == "" {
 		if server.Enabled {
 			server.Status = "disconnected"
@@ -550,157 +188,3 @@ func (s *Service) decorateMCPServer(server domain.MCPServer) domain.MCPServer {
 	server.SecretsCipher = ""
 	return server
 }
-
-func (s *Service) setMCPRuntime(id string, replacement *mcpRuntimeState) {
-	s.mcpMu.Lock()
-	previous := s.mcpRuntime[id]
-	s.mcpRuntime[id] = replacement
-	s.mcpMu.Unlock()
-	if previous != nil && previous.session != nil && previous.session != replacement.session {
-		_ = previous.session.Close()
-	}
-}
-
-func (s *Service) disconnectMCPServer(id, status string) {
-	s.setMCPRuntime(id, &mcpRuntimeState{status: status})
-}
-
-func (s *Service) decryptMCPSecrets(ciphertext string) (mcpSecrets, error) {
-	result := mcpSecrets{Env: map[string]string{}, Headers: map[string]string{}}
-	plain, err := s.encryptor.Decrypt(ciphertext)
-	if err != nil {
-		return result, err
-	}
-	if len(plain) == 0 {
-		return result, nil
-	}
-	if err := json.Unmarshal(plain, &result); err != nil {
-		return result, err
-	}
-	if result.Env == nil {
-		result.Env = map[string]string{}
-	}
-	if result.Headers == nil {
-		result.Headers = map[string]string{}
-	}
-	return result, nil
-}
-
-func validateMCPInput(input domain.MCPServerInput) error {
-	if input.Name == "" || len(input.Name) > 80 {
-		return fmt.Errorf("MCP server name must contain 1-80 characters")
-	}
-	if len(input.Args) > 64 {
-		return fmt.Errorf("MCP command supports at most 64 arguments")
-	}
-	for _, argument := range input.Args {
-		if strings.ContainsRune(argument, 0) || len(argument) > 4096 {
-			return fmt.Errorf("MCP command contains an invalid argument")
-		}
-	}
-	switch input.Transport {
-	case domain.MCPTransportStdio:
-		if input.Command == "" || strings.ContainsRune(input.Command, 0) {
-			return fmt.Errorf("command is required for stdio MCP servers")
-		}
-		if input.Cwd != "" && !filepath.IsAbs(input.Cwd) {
-			return fmt.Errorf("cwd must be an absolute path")
-		}
-	case domain.MCPTransportStreamableHTTP:
-		parsed, err := url.Parse(input.URL)
-		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-			return fmt.Errorf("url must be an absolute http or https URL")
-		}
-		if parsed.User != nil {
-			return fmt.Errorf("URL credentials are not supported; use an HTTP header")
-		}
-	default:
-		return fmt.Errorf("transport must be stdio or streamable_http")
-	}
-	return nil
-}
-
-func validateMCPSecrets(secrets mcpSecrets) error {
-	if len(secrets.Env) > 64 || len(secrets.Headers) > 64 {
-		return fmt.Errorf("MCP secrets support at most 64 environment variables and 64 headers")
-	}
-	for name, value := range secrets.Env {
-		if !mcpEnvNameRE.MatchString(name) || strings.ContainsRune(value, 0) || len(value) > 32<<10 {
-			return fmt.Errorf("invalid MCP environment variable %q", name)
-		}
-	}
-	for name, value := range secrets.Headers {
-		if strings.TrimSpace(name) == "" || http.CanonicalHeaderKey(name) == "" || strings.ContainsAny(name+value, "\r\n") || len(value) > 32<<10 {
-			return fmt.Errorf("invalid MCP HTTP header %q", name)
-		}
-		switch strings.ToLower(name) {
-		case "host", "content-length", "content-type", "accept", "mcp-session-id", "last-event-id":
-			return fmt.Errorf("MCP HTTP header %q is managed by the protocol", name)
-		}
-	}
-	return nil
-}
-
-func exposedMCPToolName(serverID, original string) string {
-	serverDigest := sha256.Sum256([]byte(serverID))
-	toolPart := strings.Trim(mcpToolNameRE.ReplaceAllString(original, "_"), "_-")
-	if toolPart == "" {
-		toolPart = "tool"
-	}
-	toolDigest := sha256.Sum256([]byte(original))
-	if len(toolPart) > 38 {
-		toolPart = toolPart[:29] + "_" + hex.EncodeToString(toolDigest[:4])
-	}
-	return "mcp__" + hex.EncodeToString(serverDigest[:5]) + "__" + toolPart
-}
-
-func truncateToolName(value string, max int) string {
-	if len(value) <= max {
-		return value
-	}
-	return value[:max]
-}
-
-func publicMCPTools(items []tool.BaseTool) []domain.MCPTool {
-	result := make([]domain.MCPTool, 0, len(items))
-	for _, item := range items {
-		info, err := item.Info(context.Background())
-		if err != nil || info == nil {
-			continue
-		}
-		rawName, _ := info.Extra[officialmcp.ExtraMCPRawToolName].(string)
-		if rawName == "" {
-			rawName = info.Name
-		}
-		result = append(result, domain.MCPTool{Name: rawName, ExposedName: info.Name, Description: info.Desc})
-	}
-	return result
-}
-
-func cloneStringMap(source map[string]string) map[string]string {
-	result := make(map[string]string, len(source))
-	for key, value := range source {
-		result[strings.TrimSpace(key)] = value
-	}
-	return result
-}
-
-func sortedMapKeys(source map[string]string) []string {
-	result := make([]string, 0, len(source))
-	for key := range source {
-		result = append(result, key)
-	}
-	sort.Strings(result)
-	return result
-}
-
-func mapAsEnvironment(values map[string]string) []string {
-	keys := sortedMapKeys(values)
-	result := make([]string, 0, len(keys))
-	for _, key := range keys {
-		result = append(result, key+"="+values[key])
-	}
-	return result
-}
-
-var _ officialmcp.ClientSession = (*mcpClientSessionAdapter)(nil)

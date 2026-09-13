@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Enterpr1se0/opsnerva/internal/domain"
+	"github.com/Enterpr1se0/opsnerva/internal/mcpclient"
 	"github.com/Enterpr1se0/opsnerva/internal/security"
 	"github.com/Enterpr1se0/opsnerva/internal/sshtunnel"
 	"github.com/Enterpr1se0/opsnerva/internal/sshx"
@@ -128,6 +129,7 @@ func TestShellLifecycleShutdownReportsUndrainedHistory(t *testing.T) {
 	// failure is deterministic and does not invalidate other cleanup paths.
 	svc := &Service{shells: newShellRegistry(), redactor: security.NewRedactor(), executionCancel: func() {}}
 	svc.tunnels = sshtunnel.New(nil, nil, nil, svc.redactor)
+	svc.mcpClients = mcpclient.New(svc.redactor, nil)
 	state := registryShell("undrained", "host", "starting")
 	history := &faultShellHistory{shellHistory: state.history, failures: 100}
 	state.history = history

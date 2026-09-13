@@ -100,7 +100,6 @@ func run(ctx context.Context, args []string) error {
 	}
 	defer app.store.Close()
 	defer app.transport.Close()
-	defer app.service.CloseMCPServers()
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -145,23 +144,32 @@ func newApplication(ctx context.Context, cfg config.Config) (*application, error
 	}
 	transport := sshx.NewNativeSSHTransport(cfg.SSH, cfg.Limits)
 	svc := service.New(st, transport, encryptor, security.NewRedactor(), cfg.Limits, cfg)
+	initialized := false
+	defer func() {
+		if !initialized {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := svc.Shutdown(shutdownCtx); err != nil {
+				slog.Warn("service cleanup failed", "component", "server", "error", err)
+			}
+			_ = transport.Close()
+			_ = st.Close()
+		}
+	}()
 	if err := svc.InitializeWorkspaces(ctx, cfg.WorkspaceDir); err != nil {
-		st.Close()
 		return nil, fmt.Errorf("initialize workspaces: %w", err)
 	}
 	if err := svc.InitializeSkills(); err != nil {
-		st.Close()
 		return nil, fmt.Errorf("initialize skill registry: %w", err)
 	}
 	if err := svc.InitializeMCPServers(ctx); err != nil {
-		st.Close()
 		return nil, fmt.Errorf("initialize MCP servers: %w", err)
 	}
 	runtime, err := agent.New(ctx, cfg.Model, svc, st)
 	if err != nil {
-		st.Close()
 		return nil, err
 	}
+	initialized = true
 	slog.InfoContext(ctx, "application initialized", "component", "server", "duration_ms", time.Since(started).Milliseconds(), "agent_available", runtime.Available())
 	return &application{config: cfg, store: st, service: svc, agent: runtime, transport: transport, startedAt: started.UTC()}, nil
 }
