@@ -1,12 +1,12 @@
 FROM node:26-alpine AS web
 WORKDIR /src/web
-RUN npm install --global pnpm@11.22.0
+RUN npm install --global pnpm@12.4.2
 COPY web/package.json web/pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY web/ ./
 RUN pnpm run build
 
-FROM golang:1.26-bookworm AS backend
+FROM golang:1.27.0-bookworm AS backend
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
