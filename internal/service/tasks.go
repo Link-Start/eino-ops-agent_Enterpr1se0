@@ -24,11 +24,6 @@ type taskState struct {
 	checkpoint time.Time
 }
 
-type executionObserver struct {
-	RunStarted func(domain.Run)
-	Output     func(string, []byte)
-}
-
 func taskStatusEvent(snapshot domain.TaskSnapshot) domain.TaskEvent {
 	return domain.TaskEvent{
 		Type: "status", TaskID: snapshot.Task.ID, Revision: snapshot.Task.Revision, Snapshot: &snapshot,

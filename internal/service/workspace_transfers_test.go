@@ -179,16 +179,21 @@ func TestWorkspaceDirectUploadUsesOneVersionBoundApproval(t *testing.T) {
 		t.Fatalf("transport did not receive the resolved version-bound source: %#v", transport.calls)
 	}
 
-	stale, err := svc.UploadWorkspaceFileToHost(context.Background(), host.ID, "project", "deploy.yaml", digest, "/tmp/deploy-2.yaml", "detect source change", "eino-agent")
+	staleCtx := WithSessionID(context.Background(), "workspace-upload-source-conflict")
+	staleEvents, stopStaleEvents := svc.SubscribeExecutionEvents(SessionIDFromContext(staleCtx))
+	defer stopStaleEvents()
+	stale, err := svc.UploadWorkspaceFileToHost(staleCtx, host.ID, "project", "deploy.yaml", digest, "/tmp/deploy-2.yaml", "detect source change", "eino-agent")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(localPath, []byte("version: 2\n"), 0o640); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.Approve(context.Background(), stale.ApprovalID, "reviewed before source changed", "operator"); err == nil || !strings.Contains(err.Error(), "version conflict") {
+	failed, err := svc.Approve(context.Background(), stale.ApprovalID, "reviewed before source changed", "operator")
+	if err == nil || !strings.Contains(err.Error(), "version conflict") || failed.Status != "failed" {
 		t.Fatalf("changed Workspace source was uploaded after approval: %v", err)
 	}
+	assertExecutionCompletion(t, svc, staleEvents, failed)
 	if len(transport.calls) != 1 {
 		t.Fatalf("version-conflicted source reached transport: %#v", transport.calls)
 	}

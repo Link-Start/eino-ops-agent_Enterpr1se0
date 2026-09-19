@@ -208,44 +208,13 @@ func (s *Service) ResumeAgentApproval(ctx context.Context, approvalID string) (d
 	}
 	approved.actor = "eino-agent"
 	if err := s.authorizeApprovedAgentSSHExecution(ctx, approved.actor, approved.host, approved.request); err != nil {
-		s.finishApprovedExecutionError(approved, err)
-		if run, loadErr := s.store.GetRun(context.WithoutCancel(ctx), approved.run.ID); loadErr == nil {
-			return execResultFromRun(run, approval.ID, ""), err
-		}
-		return domain.ExecResult{}, err
+		return s.finishApprovedExecutionError(ctx, approved, err)
 	}
 	if err := s.store.ClaimAgentApprovalRun(ctx, approval.ID, approved.run.ID); err != nil {
 		return domain.ExecResult{}, err
 	}
 	approved.run.Status = "running"
-	return s.executeApproved(ctx, approved)
-}
-
-func (s *Service) loadApprovalExecution(ctx context.Context, approval domain.Approval) (approvedExecution, error) {
-	requestData, err := s.encryptor.Decrypt(approval.RequestCipher)
-	if err != nil {
-		return approvedExecution{}, err
-	}
-	if len(requestData) == 0 {
-		requestData = []byte(approval.RequestJSON)
-	}
-	var req domain.ExecRequest
-	if err := json.Unmarshal(requestData, &req); err != nil {
-		return approvedExecution{}, err
-	}
-	_, digest, err := canonicalRequest(req)
-	if err != nil || digest != approval.RequestDigest {
-		return approvedExecution{}, fmt.Errorf("approved request digest no longer matches")
-	}
-	run, err := s.store.GetRun(ctx, approval.RunID)
-	if err != nil {
-		return approvedExecution{}, err
-	}
-	host, err := s.store.GetHost(ctx, approval.HostID)
-	if err != nil {
-		return approvedExecution{}, err
-	}
-	return approvedExecution{approval: approval, request: req, run: run, host: host}, nil
+	return s.execute(ctx, approved.host, approved.request, approved.run, approved.actor, nil)
 }
 
 func (s *Service) Approve(ctx context.Context, approvalID, reason, actor string) (domain.ExecResult, error) {
@@ -253,7 +222,7 @@ func (s *Service) Approve(ctx context.Context, approvalID, reason, actor string)
 	if err != nil {
 		return domain.ExecResult{}, err
 	}
-	return s.executeApproved(ctx, approved)
+	return s.execute(ctx, approved.host, approved.request, approved.run, approved.actor, nil)
 }
 
 func (s *Service) ApproveAsync(ctx context.Context, approvalID, reason, actor string) (domain.ExecResult, error) {
@@ -262,18 +231,9 @@ func (s *Service) ApproveAsync(ctx context.Context, approvalID, reason, actor st
 		return domain.ExecResult{}, err
 	}
 	if err := s.startApprovedExecution(ctx, approved); err != nil {
-		s.finishApprovedExecutionError(approved, err)
-		return domain.ExecResult{}, err
+		return s.finishApprovedExecutionError(ctx, approved, err)
 	}
 	return execResultFromRun(approved.run, approved.approval.ID, ""), nil
-}
-
-type approvedExecution struct {
-	approval domain.Approval
-	request  domain.ExecRequest
-	run      domain.Run
-	host     domain.Host
-	actor    string
 }
 
 func (s *Service) approveForExecution(ctx context.Context, approvalID, reason, actor string) (approvedExecution, error) {
@@ -303,102 +263,6 @@ func (s *Service) approveForExecution(ctx context.Context, approvalID, reason, a
 	s.audit(ctx, approved.run.ID, "approval_granted", actor, map[string]any{"approval_id": approval.ID, "reason": reason, "session_id": approval.SessionID})
 	logger.InfoContext(ctx, "approval granted", "run_id", approved.run.ID, "session_id", approval.SessionID)
 	return approved, nil
-}
-
-func (s *Service) startApprovedExecution(parent context.Context, approved approvedExecution) error {
-	executionCtx, cancel := context.WithCancel(context.WithoutCancel(parent))
-	s.executionMu.Lock()
-	if s.executionClosed {
-		s.executionMu.Unlock()
-		cancel()
-		return fmt.Errorf("service is shutting down")
-	}
-	if _, cancelled := s.cancelledExecutions[approved.run.ID]; cancelled {
-		delete(s.cancelledExecutions, approved.run.ID)
-		s.executionMu.Unlock()
-		cancel()
-		return context.Canceled
-	}
-	s.executionCancels[approved.run.ID] = cancel
-	s.executionWG.Add(1)
-	s.executionMu.Unlock()
-
-	stopServiceCancellation := context.AfterFunc(s.executionCtx, cancel)
-	go func() {
-		defer s.executionWG.Done()
-		defer stopServiceCancellation()
-		defer cancel()
-		defer func() {
-			s.executionMu.Lock()
-			delete(s.executionCancels, approved.run.ID)
-			delete(s.cancelledExecutions, approved.run.ID)
-			s.executionMu.Unlock()
-		}()
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				err := fmt.Errorf("approved execution stopped unexpectedly")
-				observability.FromContext(executionCtx).ErrorContext(executionCtx, "approved execution panicked", "run_id", approved.run.ID, "panic", s.redactor.Redact(fmt.Sprint(recovered)))
-				s.finishApprovedExecutionError(approved, err)
-			}
-		}()
-		_, _ = s.executeApproved(executionCtx, approved)
-	}()
-	return nil
-}
-
-func (s *Service) cancelApprovedExecution(runID string) bool {
-	if runID == "" {
-		return false
-	}
-	s.executionMu.Lock()
-	cancel := s.executionCancels[runID]
-	if cancel == nil {
-		s.cancelledExecutions[runID] = struct{}{}
-	}
-	s.executionMu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-	return true
-}
-
-func (s *Service) executeApproved(ctx context.Context, approved approvedExecution) (domain.ExecResult, error) {
-	result, err := s.execute(ctx, approved.host, approved.request, approved.run, approved.actor, nil)
-	if err == nil {
-		return result, nil
-	}
-	s.finishApprovedExecutionError(approved, err)
-	if result.RunID != "" {
-		return result, err
-	}
-	run, loadErr := s.store.GetRun(context.WithoutCancel(ctx), approved.run.ID)
-	if loadErr == nil {
-		result = execResultFromRun(run, approved.approval.ID, "")
-	}
-	return result, err
-}
-
-func (s *Service) finishApprovedExecutionError(approved approvedExecution, cause error) {
-	defer s.clearExecutionOwner(approved.run.ID)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	run, err := s.store.GetRun(ctx, approved.run.ID)
-	if err != nil || (run.Status != "created" && run.Status != "approval_required" && run.Status != "running") {
-		return
-	}
-	run.Status = "failed"
-	if errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
-		run.Status = "interrupted"
-	}
-	run.Error = s.redactor.Redact(cause.Error())
-	run.CompletedAt = time.Now().UTC()
-	if err := s.store.UpdateRun(ctx, run); err != nil {
-		observability.FromContext(ctx).ErrorContext(ctx, "persist approved execution failure failed", "run_id", run.ID, "error", err)
-		return
-	}
-	s.publishExecutionEvent(ExecutionEvent{SessionID: run.SessionID, RunID: run.ID, Status: run.Status})
-	s.audit(ctx, run.ID, "command_completed", approved.actor, map[string]any{"status": run.Status, "error": run.Error})
-	observability.FromContext(ctx).ErrorContext(ctx, "approved execution stopped before completion", "run_id", run.ID, "status", run.Status, "error", run.Error)
 }
 
 func (s *Service) Reject(ctx context.Context, approvalID, reason, actor string) error {

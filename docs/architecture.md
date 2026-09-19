@@ -51,7 +51,10 @@ App 控制面通过 loopback HTTP API 连接本地 Sidecar。`auth.password` 非
 | `model_providers.go`、`models.go` | 提供商配置与凭据管理；模型发现与连接测试配置 |
 | `system_settings.go` | 系统配置与 MCP HTTP 访问令牌 |
 | `execution_request.go`、`command_validation.go` | 请求规范化、摘要与参数校验；命令契约校验 |
-| `execution.go` | 提交、审批分流、执行与并发限制 |
+| `execution.go` | 请求提交、权限/摘要校验、审批分流与 Run 创建 |
+| `execution_runner.go`、`execution_limits.go` | 执行前准备、Transport 分派与流式输出；共享并发额度获取和释放 |
+| `execution_completion.go`、`execution_result.go` | 执行终态分类、脱敏加密和保存；运行记录与工具结果投影 |
+| `approval_execution.go` | 审批载荷恢复、后台执行登记/取消，以及进入执行前的失败收尾 |
 | `history.go`、`audit_history.go` | 运行历史查询与原文读取；审计查询、删除与追加 |
 | `recovery.go` | 启动时恢复中断的任务、运行和工具记录 |
 | `websearch.go` | 动态解析 Web Search 配置与凭据、调用独立 Client、写入调用审计 |
@@ -127,7 +130,15 @@ OAuth 刷新绑定连接生命周期，不随发起授权/重连的 HTTP 请求�
 
 组件测试覆盖迟到连接、并发禁用/调用、关闭等待、临时连接隔离、快照拷贝、连接退出与发现约束；真实 HTTP 集成验证调用取消及审计、建立期间禁用、OAuth 授权关闭、Token 刷新生命周期与过期写回。未改 SQL、前端订阅或外部 MCP 工具审批边界。
 
-后续阶段：梳理 Execution、Approval、Task 的交叉调用，统一完成与取消路径，并分离业务状态更新和事件发布，再调整调用方装配。每阶段独立验证。
+第十阶段完成 Execution 收尾子阶段。提交入口、实际执行、并发额度、结果落盘和结果投影按职责分离；Task 使用的执行观察函数归回 Execution。批准载荷恢复与后台执行交接移到 `approval_execution.go`，删除批准后再补做失败落盘的 `executeApproved` 包装，不增加持有 Service 的适配器或第二套执行引擎。
+
+已创建 Run 的正常执行、等待并发额度时取消、Workspace 源版本冲突、远端文件准备失败和 SSH 连接准备失败，都返回同一收尾入口。先计算状态和脱敏视图、加密原始输出，再用脱离调用方取消且最多 5 秒的 context 更新 Run；写入失败保留 Run ID、已知输出与原始错误并返回持久化错误，不发布未保存的终态。更新成功后追加一次 `command_completed` 审计再发布终态；执行前失败不再另外产生 `command_failed`，状态和错误由审计字段表达。Run 更新与审计追加仍不是一个事务，审计写入失败沿用现有日志上报，不宣称原子提交。
+
+未开始的操作使用退出码 -1，不再误显为 0；取消标记为 interrupted，已明确执行成功的结果不会因为稍后请求取消被改成失败。非零退出码但有有效 stdout 仍为 partial；读取分页、搜索、文件变更、Shell/Tunnel 结果和流式脱敏保持原有协议。输出刷新与并发额度释放在执行层完成，随后做结果保存，不让收尾 I/O 继续占用远程执行额度。批准前后校验、异步批准不随 HTTP 请求结束、取消登记与 Shutdown 等待语义不变；启动前取消和后台 worker panic 使用同一终态保存逻辑。
+
+回归测试先复现旧路径丢失 Run ID、错误退出码和丢失原始错误的问题，再覆盖实际主机额度等待时取消、准备/完成写失败不发布终态、取消后原文输出保存、错误脱敏、Workspace 批准后源变化，以及批准执行失败只结束一次。未改 SQL、前端、工具输入契约或 Eino checkpoint。
+
+后续阶段：继续解耦 Approval 决策/说明生成与 Task 状态投影，统一执行取消登记；将 Execution 事件函数中附带的 ChatToolCall、Task 持久化与订阅广播分离，再调整调用方装配。当前仍不承诺数据库不可用时结果一定落盘，也未实现跨上述记录的原子提交。每阶段独立验证。
 
 ## Dynamic extensions
 

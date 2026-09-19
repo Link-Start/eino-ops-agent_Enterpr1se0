@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -185,4 +186,60 @@ func TestApproveAsyncExecutesConcurrentDecisionOnlyOnce(t *testing.T) {
 	callCount := len(transport.calls)
 	transport.mu.Unlock()
 	t.Fatalf("approved operation executed %d times, want once", callCount)
+}
+
+func TestApprovedExecutionFailuresUseOneCompletionPath(t *testing.T) {
+	for _, failure := range []string{"before launch", "transport", "panic"} {
+		t.Run(failure, func(t *testing.T) {
+			svc, transport, host := newTestService(t)
+			ctx := WithSessionID(context.Background(), "approved-execution-failure")
+			events, unsubscribe := svc.SubscribeExecutionEvents(SessionIDFromContext(ctx))
+			defer unsubscribe()
+			pending, err := svc.Submit(ctx, domain.ExecRequest{
+				HostID: host.ID, Mode: domain.ExecProgram, Program: "uname", Reason: "inspect host",
+			}, "eino-agent")
+			if err != nil || pending.Status != "approval_required" {
+				t.Fatalf("execution did not wait for approval: %+v err=%v", pending, err)
+			}
+			wantStatus := "failed"
+			switch failure {
+			case "before launch":
+				svc.cancelApprovedExecution(pending.RunID)
+				wantStatus = "interrupted"
+			case "transport":
+				transport.execErr = errors.New("connection closed")
+			case "panic":
+				svc.transport = &completionHookTransport{fakeTransport: transport, afterExec: func() { panic("transport failure") }}
+			}
+			result, err := svc.ApproveAsync(context.Background(), pending.ApprovalID, "reviewed", "operator")
+			if failure == "before launch" {
+				if !errors.Is(err, context.Canceled) || result.Status != wantStatus || result.RunID != pending.RunID {
+					t.Fatalf("pre-launch cancellation lost its result: %+v err=%v", result, err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan struct{})
+			go func() {
+				svc.executionWG.Wait()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("approved worker did not finish")
+			}
+			run, err := svc.store.GetRun(context.Background(), pending.RunID)
+			if err != nil || run.Status != wantStatus {
+				t.Fatalf("approved failure was not saved: %+v err=%v", run, err)
+			}
+			assertExecutionCompletion(t, svc, events, execResultFromRun(run, pending.ApprovalID, ""))
+			svc.executionMu.Lock()
+			remaining := len(svc.executionCancels) + len(svc.cancelledExecutions)
+			svc.executionMu.Unlock()
+			if remaining != 0 {
+				t.Fatal("finished approval kept its cancellation registration")
+			}
+		})
+	}
 }
