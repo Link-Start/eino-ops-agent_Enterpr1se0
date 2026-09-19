@@ -62,13 +62,11 @@ func TestShellEventWriterBatchesAndStopsWhenIdle(t *testing.T) {
 		if history.attempts != 0 {
 			t.Fatal("small batch was persisted synchronously")
 		}
-		time.Sleep(sshShellPersistDelay)
-		synctest.Wait()
+		synctest.Sleep(sshShellPersistDelay)
 		if history.attempts != 1 || commits != 1 {
 			t.Fatal("delayed batch did not commit")
 		}
-		time.Sleep(time.Hour)
-		synctest.Wait()
+		synctest.Sleep(time.Hour)
 		if history.attempts != 1 {
 			t.Fatal("idle writer kept flushing")
 		}
@@ -95,8 +93,7 @@ func TestShellEventWriterRetriesWithoutLosingOrDuplicatingEvents(t *testing.T) {
 		if err := writer.append(writerEvent(1), "output", false); err != nil {
 			t.Fatal(err)
 		}
-		time.Sleep(time.Second)
-		synctest.Wait()
+		synctest.Sleep(time.Second)
 		if history.attempts != 3 || commits != 1 || failed != 0 {
 			t.Fatalf("retry accounting: attempts=%d commits=%d failed=%d", history.attempts, commits, failed)
 		}
@@ -116,8 +113,7 @@ func TestShellEventWriterPermanentFailureIsBounded(t *testing.T) {
 		failed := 0
 		writer := newShellEventWriter(history, func() {}, func(error) { failed++ })
 		_ = writer.append(writerEvent(1), "", false)
-		time.Sleep(time.Hour)
-		synctest.Wait()
+		synctest.Sleep(time.Hour)
 		if history.attempts != maxShellPersistAttempts || failed != 1 {
 			t.Fatalf("attempts=%d failed=%d", history.attempts, failed)
 		}
@@ -125,8 +121,7 @@ func TestShellEventWriterPermanentFailureIsBounded(t *testing.T) {
 			t.Fatal("close hid permanent persistence failure")
 		}
 		attempts := history.attempts
-		time.Sleep(time.Hour)
-		synctest.Wait()
+		synctest.Sleep(time.Hour)
 		if history.attempts != attempts || failed != 1 {
 			t.Fatal("retry or failure notification survived close")
 		}
@@ -161,8 +156,7 @@ func TestShellEventWriterCloseJoinsInFlightFlush(t *testing.T) {
 		if err := <-closed; err != nil {
 			t.Fatal(err)
 		}
-		time.Sleep(time.Hour)
-		synctest.Wait()
+		synctest.Sleep(time.Hour)
 		if history.attempts != 1 {
 			t.Fatalf("flush count after close=%d", history.attempts)
 		}
@@ -206,8 +200,7 @@ func TestShellEventWriterRequestCancellationDoesNotStopGeneration(t *testing.T) 
 		if failed != 0 {
 			t.Fatal("canceled read requests stopped the generation")
 		}
-		time.Sleep(sshShellPersistDelay)
-		synctest.Wait()
+		synctest.Sleep(sshShellPersistDelay)
 		if err := writer.close(context.Background()); err != nil {
 			t.Fatal(err)
 		}
@@ -226,8 +219,7 @@ func TestShellEventWriterFinalFlushHonorsDeadline(t *testing.T) {
 		if err := writer.close(ctx); !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("close deadline=%v", err)
 		}
-		time.Sleep(time.Hour)
-		synctest.Wait()
+		synctest.Sleep(time.Hour)
 		if history.attempts != 1 || failed != 1 {
 			t.Fatalf("deadline retried: attempts=%d failed=%d", history.attempts, failed)
 		}
@@ -246,8 +238,7 @@ func TestShellStatusDeliveryDoesNotDependOnRetrySuccess(t *testing.T) {
 		if len(subscriber.events) != 1 {
 			t.Fatal("failed first write hid the live status")
 		}
-		time.Sleep(time.Second)
-		synctest.Wait()
+		synctest.Sleep(time.Second)
 		if len(subscriber.events) != 1 {
 			t.Fatal("retry duplicated the live status")
 		}

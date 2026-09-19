@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/Enterpr1se0/opsnerva/internal/domain"
@@ -318,9 +319,9 @@ func prepareModelTurn(turn storedModelTurn, providerKind string, turnIndex int) 
 }
 
 func modelTurnBoundaryID(turn storedModelTurn) string {
-	for index := len(turn.messages) - 1; index >= 0; index-- {
-		if turn.messages[index].ID != "" {
-			return turn.messages[index].ID
+	for _, message := range slices.Backward(turn.messages) {
+		if message.ID != "" {
+			return message.ID
 		}
 	}
 	return turn.user.ID

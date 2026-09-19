@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -1919,9 +1920,7 @@ func decode(w http.ResponseWriter, r *http.Request, target any) bool {
 
 func decodeLimit(w http.ResponseWriter, r *http.Request, target any, maxBytes int64) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
+	if err := jsonv2.UnmarshalRead(r.Body, target, jsonv2.RejectUnknownMembers(true)); err != nil {
 		writeErrorStatus(w, fmt.Errorf("invalid JSON: %w", err), http.StatusBadRequest)
 		return false
 	}

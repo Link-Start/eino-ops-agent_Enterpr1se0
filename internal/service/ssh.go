@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -67,8 +68,8 @@ func (s *Service) resolveSSHConnection(ctx context.Context, target domain.Host) 
 		nearestFirst = append(nearestFirst, jump)
 		current = jump
 	}
-	for index := len(nearestFirst) - 1; index >= 0; index-- {
-		connection.Jumps = append(connection.Jumps, nearestFirst[index])
+	for _, jump := range slices.Backward(nearestFirst) {
+		connection.Jumps = append(connection.Jumps, jump)
 	}
 
 	binding := sshConnectionBinding{Target: bindSSHHost(connection.Target)}

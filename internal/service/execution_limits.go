@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"slices"
 	"sort"
 )
 
@@ -42,16 +43,16 @@ func (s *Service) acquire(ctx context.Context, hostIDs ...string) (func(), error
 		case hostSem <- struct{}{}:
 			acquired = append(acquired, hostSem)
 		case <-ctx.Done():
-			for index := len(acquired) - 1; index >= 0; index-- {
-				<-acquired[index]
+			for _, acquiredSem := range slices.Backward(acquired) {
+				<-acquiredSem
 			}
 			<-s.globalSem
 			return nil, ctx.Err()
 		}
 	}
 	return func() {
-		for index := len(acquired) - 1; index >= 0; index-- {
-			<-acquired[index]
+		for _, acquiredSem := range slices.Backward(acquired) {
+			<-acquiredSem
 		}
 		<-s.globalSem
 	}, nil

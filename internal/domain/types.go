@@ -473,7 +473,7 @@ type MCPToolCall struct {
 	Error           string    `json:"error,omitempty"`
 	StartedAt       time.Time `json:"started_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
-	CompletedAt     time.Time `json:"completed_at,omitempty,omitzero"`
+	CompletedAt     time.Time `json:"completed_at,omitzero"`
 }
 
 type MCPActivitySnapshot struct {
@@ -587,7 +587,7 @@ type ChatToolCall struct {
 	Error         string    `json:"error,omitempty"`
 	StartedAt     time.Time `json:"started_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
-	CompletedAt   time.Time `json:"completed_at,omitempty,omitzero"`
+	CompletedAt   time.Time `json:"completed_at,omitzero"`
 }
 
 type ChatAttachment struct {
@@ -761,7 +761,7 @@ type ExecResult struct {
 	StderrOffsetBytes   int               `json:"stderr_offset_bytes,omitempty"`
 	WaitDeadlineReached bool              `json:"wait_deadline_reached,omitempty"`
 	Duration            time.Duration     `json:"duration,omitempty"`
-	CompletedAt         time.Time         `json:"completed_at,omitempty,omitzero"`
+	CompletedAt         time.Time         `json:"completed_at,omitzero"`
 	File                *FileMetadata     `json:"file,omitempty"`
 	Change              *FileChange       `json:"change,omitempty"`
 	Search              *FileSearchResult `json:"search,omitempty"`
@@ -817,7 +817,7 @@ type SSHShell struct {
 	TerminationReason string    `json:"termination_reason,omitempty"`
 	Error             string    `json:"error,omitempty"`
 	StartedAt         time.Time `json:"started_at"`
-	EndedAt           time.Time `json:"ended_at,omitempty,omitzero"`
+	EndedAt           time.Time `json:"ended_at,omitzero"`
 }
 
 type SSHShellEvent struct {
@@ -974,7 +974,7 @@ type Run struct {
 	AIReviewJSON      string         `json:"-"`
 	AIReview          *CommandReview `json:"ai_review,omitempty"`
 	StartedAt         time.Time      `json:"started_at"`
-	CompletedAt       time.Time      `json:"completed_at,omitempty,omitzero"`
+	CompletedAt       time.Time      `json:"completed_at,omitzero"`
 }
 
 type RunSearchFilter struct {
@@ -997,7 +997,7 @@ type RunSearchPage struct {
 	Runs          []Run     `json:"runs"`
 	HasMore       bool      `json:"has_more"`
 	ScanLimited   bool      `json:"scan_limited,omitempty"`
-	NextStartedAt time.Time `json:"next_started_at,omitempty,omitzero"`
+	NextStartedAt time.Time `json:"next_started_at,omitzero"`
 	NextID        string    `json:"next_id,omitempty"`
 }
 
@@ -1025,7 +1025,7 @@ type Approval struct {
 	InterruptID      string         `json:"-"`
 	AIReview         *CommandReview `json:"ai_review,omitempty"`
 	CreatedAt        time.Time      `json:"created_at"`
-	DecidedAt        time.Time      `json:"decided_at,omitempty,omitzero"`
+	DecidedAt        time.Time      `json:"decided_at,omitzero"`
 }
 
 type Task struct {
@@ -1038,7 +1038,7 @@ type Task struct {
 	Revision            uint64    `json:"revision"`
 	OperatorInstruction string    `json:"operator_instruction,omitempty"`
 	StartedAt           time.Time `json:"started_at"`
-	EndedAt             time.Time `json:"ended_at,omitempty,omitzero"`
+	EndedAt             time.Time `json:"ended_at,omitzero"`
 }
 
 type TaskSnapshot struct {
@@ -1070,6 +1070,6 @@ type AuditEvent struct {
 type AuditEventPage struct {
 	Events        []AuditEvent `json:"events"`
 	HasMore       bool         `json:"has_more"`
-	NextCreatedAt time.Time    `json:"next_created_at,omitempty,omitzero"`
+	NextCreatedAt time.Time    `json:"next_created_at,omitzero"`
 	NextID        string       `json:"next_id,omitempty"`
 }

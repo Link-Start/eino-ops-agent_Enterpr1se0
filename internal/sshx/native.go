@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -542,8 +543,8 @@ func (t *NativeSSHTransport) connect(ctx context.Context, connection ConnectionS
 	hops := append(append([]domain.Host(nil), connection.Jumps...), connection.Target)
 	clients := make([]*ssh.Client, 0, len(hops))
 	closeClients := func() {
-		for index := len(clients) - 1; index >= 0; index-- {
-			_ = clients[index].Close()
+		for _, client := range slices.Backward(clients) {
+			_ = client.Close()
 		}
 	}
 	for index, host := range hops {
@@ -617,8 +618,8 @@ func (c *nativeClient) Close() error {
 	var closeErr error
 	c.once.Do(func() {
 		c.cancel()
-		for index := len(c.clients) - 1; index >= 0; index-- {
-			if err := c.clients[index].Close(); closeErr == nil {
+		for _, client := range slices.Backward(c.clients) {
+			if err := client.Close(); closeErr == nil {
 				closeErr = err
 			}
 		}

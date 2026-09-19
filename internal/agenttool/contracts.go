@@ -237,7 +237,7 @@ type HistoryRunSummary struct {
 	ExitCode    int       `json:"exit_code"`
 	DurationMS  int64     `json:"duration_ms,omitempty"`
 	StartedAt   time.Time `json:"started_at"`
-	CompletedAt time.Time `json:"completed_at,omitempty,omitzero"`
+	CompletedAt time.Time `json:"completed_at,omitzero"`
 }
 
 type HistoryRunDetail struct {
