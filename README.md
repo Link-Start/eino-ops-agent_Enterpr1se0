@@ -150,7 +150,7 @@ docker run --rm -p 8080:8080 \
 
 ### 从源码构建
 
-需要 Git、Go 1.26+、Node.js 22.13+（Linux / macOS 另需 `make`）：
+需要 Git、Go 1.27+、Node.js 22.13+（Linux / macOS 另需 `make`，macOS 需要 13+）：
 
 ```bash
 git clone https://github.com/Enterpr1se0/opsnerva.git

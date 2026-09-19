@@ -38,7 +38,7 @@ flowchart LR
 
 首次启动会在安装目录创建 `config.yaml`、`data/` 和 `workspace/`，然后直接进入 App。
 
-从源码构建需要 Go 1.26+、Node.js 22.13+ 和 Rust stable。Windows 生成 NSIS 安装包：
+从源码构建需要 Go 1.27+、Node.js 22.13+ 和 Rust stable。Windows 生成 NSIS 安装包：
 
 ```powershell
 pnpm --dir web install --frozen-lockfile
@@ -81,11 +81,11 @@ docker run --rm -e OPSNERVA_LISTEN=0.0.0.0 -p 127.0.0.1:8080:8080 \
 准备以下环境：
 
 - Git
-- Go 1.26+
-- Node.js 22.13+ 与 pnpm 11
+- Go 1.27+
+- Node.js 22.13+ 与 pnpm 12
 - 一个支持 Tool Calling 的 OpenAI 兼容模型
 
-Linux / macOS 的快捷构建命令还需要 `make`。内置 SSH 不依赖系统中的 `ssh` 命令。Bubblewrap 仅用于 Linux 上的 Workspace Shell 沙箱，不影响服务启动和 SSH 功能。
+Linux / macOS 的快捷构建命令还需要 `make`，macOS 需要 13 或更高版本。内置 SSH 不依赖系统中的 `ssh` 命令。Bubblewrap 仅用于 Linux 上的 Workspace Shell 沙箱，不影响服务启动和 SSH 功能。
 
 ### Linux / macOS
 
